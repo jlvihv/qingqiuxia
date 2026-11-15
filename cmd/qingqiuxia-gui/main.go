@@ -10,6 +10,8 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
+	"runtime"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -18,7 +20,41 @@ import (
 	qqx "github.com/jlvihv/qingqiuxia/internal/ui"
 )
 
+// tuneRuntime bounds what the process spends before any window exists.
+//
+// Measured on a 32-core machine, idle, one window, with the GPU unavailable:
+//
+//	default                     183 MB RSS, 94 threads
+//	GOMAXPROCS=4                168 MB RSS, 81 threads
+//	GOMAXPROCS=4 LP_NUM_THREADS=2 184 MB RSS, 21 threads
+//
+// When the GPU works, its threads and its driver are worth their cost and none
+// of this applies; when it does not, Mesa falls back to llvmpipe, which JITs
+// shaders with libLLVM (163 MB resident) and spreads them over as many threads
+// as there are cores. Both numbers are bounded here, whatever the renderer
+// turns out to be:
+//
+//   - GOMAXPROCS: this window runs one goroutine of work on the main thread
+//     plus a client goroutine. Thirty-two scheduler threads cost their stacks
+//     and a slot each in every GC, for nothing.
+//   - LP_NUM_THREADS: llvmpipe's rasteriser threads. A window redrawing a
+//     table does not fill 32 of them; four keep scrolling smooth and stop the
+//     process from holding a core's worth of warm threads while idle.
+//
+// A user who wants the defaults back sets the variables themselves: these only
+// fill in what is unset.
+func tuneRuntime() {
+	if os.Getenv("GOMAXPROCS") == "" {
+		runtime.GOMAXPROCS(4)
+	}
+	if os.Getenv("LP_NUM_THREADS") == "" {
+		os.Setenv("LP_NUM_THREADS", "4")
+	}
+}
+
 func main() {
+	tuneRuntime()
+
 	var (
 		apiAddr = flag.String("api", "127.0.0.1:8898", "the core's control API address")
 		token   = flag.String("token", "", "the core's API token, if it has one")
@@ -50,7 +86,14 @@ func main() {
 		client := qqx.NewClient(*apiAddr, *token)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		go client.Live(ctx, store, invalidate)
+		go client.Live(ctx, store, invalidate, func() {
+			mygo.RunOnMain(func() {
+				app.InvalidateAppend()
+				if win != nil {
+					win.Invalidate()
+				}
+			})
+		})
 		go followStatus(ctx, client, app, invalidate)
 	}
 

@@ -109,6 +109,9 @@ type Store struct {
 	sessions []Session
 	byID     map[uint64]int
 	limit    int
+	// window is the index of the oldest session once the store is full; new
+	// sessions overwrite rows from there, so nothing is ever shifted.
+	window int
 	// total counts what the core holds, which is more than the window keeps.
 	total   int
 	dropped uint64
@@ -124,6 +127,11 @@ func NewStore(limit int) *Store {
 
 // Upsert records a session, replacing the row with its ID if it is there.
 // A session arrives twice: once when it starts and once when it ends.
+//
+// New sessions are appended and the window reads the list backwards, so the
+// hot path — a request arriving — is an append. Inserting at the front instead
+// moved the whole slice on every request, which at a few thousand rows is the
+// difference between a list that keeps up and one that stutters.
 func (s *Store) Upsert(sess Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -131,23 +139,58 @@ func (s *Store) Upsert(sess Session) {
 		s.sessions[i] = sess
 		return
 	}
-	// The list is newest first, so a new session goes to the front.
-	s.sessions = append(s.sessions, Session{})
-	copy(s.sessions[1:], s.sessions[:len(s.sessions)-1])
-	s.sessions[0] = sess
-	s.reindexLocked()
-	if len(s.sessions) > s.limit {
-		s.sessions = s.sessions[:s.limit]
-		s.reindexLocked()
+	if len(s.sessions) < s.limit {
+		s.byID[sess.ID] = len(s.sessions)
+		s.sessions = append(s.sessions, sess)
+		return
 	}
+	// Full: overwrite the oldest row in place and move the window's start.
+	// Replacing and advancing is O(1); shifting the slice and rebuilding the
+	// index was O(n) on every arriving request once the list was full, which
+	// at five thousand rows cost a fifth of a millisecond each.
+	delete(s.byID, s.sessions[s.window].ID)
+	s.sessions[s.window] = sess
+	s.byID[sess.ID] = s.window
+	s.window = (s.window + 1) % len(s.sessions)
 }
 
-// reindexLocked rebuilds the ID index; called after a shift or a trim.
+// latestLocked is the index of the newest session.
+func (s *Store) latestLocked() int {
+	last := len(s.sessions) - 1
+	return (s.window + last) % len(s.sessions)
+}
+
+// rowLocked is the index of the session at a row of the window's order, newest
+// first.
+func (s *Store) rowLocked(row int) int {
+	// Row 0 is the newest, which sits just before the oldest.
+	return (s.window + len(s.sessions) - 1 - row) % len(s.sessions)
+}
+
+// At returns the session at a row of the window's order, newest first.
+func (s *Store) At(row int) (Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if row < 0 || row >= len(s.sessions) {
+		return Session{}, false
+	}
+	return s.sessions[s.rowLocked(row)], true
+}
+
+// reindexLocked rebuilds the ID index after a trim.
 func (s *Store) reindexLocked() {
 	clear(s.byID)
 	for i := range s.sessions {
 		s.byID[s.sessions[i].ID] = i
 	}
+}
+
+// Has reports whether the store holds a session.
+func (s *Store) Has(id uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.byID[id]
+	return ok
 }
 
 // Remove forgets a session, which the core dropped from its ring.
@@ -183,32 +226,12 @@ func (s *Store) Len() int {
 	return len(s.sessions)
 }
 
-// At returns the session at a row.
-func (s *Store) At(row int) (Session, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if row < 0 || row >= len(s.sessions) {
-		return Session{}, false
-	}
-	return s.sessions[row], true
-}
-
 // Clear empties the window's list.
 func (s *Store) Clear() {
 	s.mu.Lock()
 	s.sessions = nil
 	clear(s.byID)
 	s.mu.Unlock()
-}
-
-// Snapshot returns every session, newest first, for a caller that iterates a
-// stable copy.
-func (s *Store) Snapshot() []Session {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]Session, len(s.sessions))
-	copy(out, s.sessions)
-	return out
 }
 
 // Filter narrows the list. The empty filter matches everything.

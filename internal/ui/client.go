@@ -321,7 +321,7 @@ func (c *Client) Stream(ctx context.Context, fn func(Event)) error {
 //
 // It runs until ctx is cancelled, and is meant to be started in its own
 // goroutine, with invalidate called to ask for a frame when the store changes.
-func (c *Client) Live(ctx context.Context, store *Store, invalidate func()) {
+func (c *Client) Live(ctx context.Context, store *Store, invalidate func(), appendHint func()) {
 	for ctx.Err() == nil {
 		if err := c.load(ctx, store, invalidate); err != nil {
 			// A core that is not running yet is not an error worth showing:
@@ -330,8 +330,14 @@ func (c *Client) Live(ctx context.Context, store *Store, invalidate func()) {
 			continue
 		}
 		if err := c.Stream(ctx, func(ev Event) {
-			c.apply(ev, store)
-			invalidate()
+			appended := c.apply(ev, store)
+			if appended {
+				// An arriving session only extends the list: the window does
+				// not need to refilter thousands of rows for it.
+				appendHint()
+			} else {
+				invalidate()
+			}
 		}); err != nil {
 			sleep(ctx, 500*time.Millisecond)
 		}
@@ -360,20 +366,30 @@ func (c *Client) load(ctx context.Context, store *Store, invalidate func()) erro
 	return nil
 }
 
-// apply folds one streamed event into the store.
-func (c *Client) apply(ev Event, store *Store) {
+// apply folds one streamed event into the store, reporting whether it only
+// appended a new session at the newest end.
+func (c *Client) apply(ev Event, store *Store) (appended bool) {
 	switch ev.Name {
 	case "session":
 		var w wireSession
-		if json.Unmarshal(ev.Data, &w) == nil {
-			store.Upsert(w.toSession())
+		if json.Unmarshal(ev.Data, &w) != nil {
+			return false
 		}
+		sess := w.toSession()
+		if store.Has(w.ID) {
+			// The same session, now complete: its row changes in place.
+			store.Upsert(sess)
+			return false
+		}
+		store.Upsert(sess)
+		return true
 	case "dropped":
 		var w wireSession
 		if json.Unmarshal(ev.Data, &w) == nil {
 			store.Remove(w.ID)
 		}
 	}
+	return false
 }
 
 // sleep waits for d, or until ctx is cancelled.

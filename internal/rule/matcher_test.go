@@ -26,9 +26,13 @@ func TestMatcher(t *testing.T) {
 		{"example.com/api/*", "https", "example.com", "/api/users", true},
 		{"example.com/api/*", "https", "example.com", "/api/", true},
 		{"example.com/api/*", "https", "example.com", "/web/users", false},
-		// "*" does not cross a path separator, "**" does.
-		{"example.com/api/*", "https", "example.com", "/api/a/b", false},
+		// "*" crosses a path separator, so that "example.com/api/*" means
+		// every path under /api, which is what a user writing it means. "**"
+		// is the same thing spelled out.
+		{"example.com/api/*", "https", "example.com", "/api/a/b", true},
 		{"example.com/api/**", "https", "example.com", "/api/a/b", true},
+		// The prefix still has to match.
+		{"example.com/api/*", "https", "example.com", "/web/a", false},
 
 		// A wildcard host.
 		{"*.example.com", "https", "api.example.com", "/", true},
@@ -44,6 +48,17 @@ func TestMatcher(t *testing.T) {
 		// "?" matches one character.
 		{"example.com/v?", "https", "example.com", "/v1", true},
 		{"example.com/v?", "https", "example.com", "/v12", false},
+		// A whole host is matched by "host/*", deeply.
+		{"api.example.com/*", "https", "api.example.com", "/v1/login", true},
+		{"api.example.com/*", "https", "api.example.com", "/a/b/c/d", true},
+
+		// A pattern with no host matches any host: this is how a user writes
+		// "every request whose path ends in /login", and reading the leading
+		// "*" as a host once left the rule matching nothing.
+		{"*/login", "https", "api.example.com", "/v1/login", true},
+		{"*/login", "https", "anything.test", "/login", true},
+		{"*/login", "https", "api.example.com", "/v1/logout", false},
+		{"**/login", "https", "api.example.com", "/v1/login", true},
 	}
 	for _, tc := range tests {
 		m, err := ParseMatcher(tc.pattern)

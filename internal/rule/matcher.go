@@ -62,6 +62,14 @@ func ParseMatcher(pattern string) (*Matcher, error) {
 	if i := strings.IndexByte(rest, '/'); i >= 0 {
 		authority, m.path = rest[:i], rest[i:]
 	}
+	// A leading wildcard is part of the path when the pattern names no host:
+	// "*/login" means any host, the path ending in /login, and reading the
+	// "*" as a host would drop it and leave "/login" to match exactly, which
+	// is a rule that never fires.
+	if authority == "*" || authority == "**" {
+		m.path = authority + m.path
+		authority = ""
+	}
 
 	// A bare "example.com" or "*.example.com" also names the host alone.
 	for _, alt := range strings.Split(authority, ",") {
@@ -97,20 +105,28 @@ func ParseMatcher(pattern string) (*Matcher, error) {
 }
 
 // compileWildcard turns a glob into an anchored regexp.
+//
+// "*" matches any run of characters, including "/", and "**" is the same thing
+// spelled out. Crossing "/" is the choice that matters: a user who writes
+// "api.example.com/*" means every path on that host, and a "*" that stopped at
+// a separator would match only the first segment, which looks like the rule
+// silently not working. mitmproxy's and Charles's wildcards cross "/" too, so
+// there is nothing to relearn. "?" matches one character, again including "/",
+// for the same reason.
 func compileWildcard(glob string) (*regexp.Regexp, error) {
 	var b strings.Builder
 	b.WriteString(`(?s)^`)
 	for i := 0; i < len(glob); i++ {
 		switch c := glob[i]; c {
 		case '*':
+			b.WriteString(`.*`)
 			if i+1 < len(glob) && glob[i+1] == '*' {
-				b.WriteString(`.*`)
+				// "**" is "*" written twice; consume the pair so the regexp
+				// does not carry a redundant ".*.*".
 				i++
-			} else {
-				b.WriteString(`[^/]*`)
 			}
 		case '?':
-			b.WriteString(`[^/]`)
+			b.WriteString(`.`)
 		default:
 			b.WriteString(regexp.QuoteMeta(string(c)))
 		}

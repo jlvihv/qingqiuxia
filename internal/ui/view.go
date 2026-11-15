@@ -48,6 +48,8 @@ type App struct {
 	// does not re-filter a list of thousands twice.
 	visible      []int
 	visibleDirty bool
+	hostList     []HostCount
+	hostsDirty   bool
 	// list is the table's own state, which must outlive a frame.
 	list *ui.ListState
 }
@@ -72,6 +74,7 @@ func NewApp(store *Store) *App {
 		MainWidth:    800,
 		Recording:    true,
 		visibleDirty: true,
+		hostsDirty:   true,
 	}
 }
 
@@ -99,17 +102,60 @@ func (a *App) SetCoreDown(err error) {
 func (a *App) Down() string { return a.down }
 
 // Invalidate tells the app its filter or data changed.
-func (a *App) Invalidate() { a.visibleDirty = true }
+func (a *App) Invalidate() {
+	a.visibleDirty = true
+	a.hostsDirty = true
+}
+
+// InvalidateAppend tells the app one session was added at the newest end,
+// which is the case for every arriving request.
+//
+// It extends the filtered rows instead of refiltering them: a burst of requests
+// is what a proxy produces, and walking thousands of rows per arrival is what
+// makes a live list stutter. A changed filter still refilters, and so does a
+// session that arrives again with new contents.
+func (a *App) InvalidateAppend() {
+	a.hostsDirty = true
+	if a.visibleDirty || a.visible == nil {
+		// The rows are stale for another reason; the next Visible sorts it out.
+		return
+	}
+	// A row is its distance from the newest session, so a new one at the front
+	// pushes every existing row down by one.
+	for i := range a.visible {
+		a.visible[i]++
+	}
+	if sess, ok := a.Store.At(0); ok && a.Filter.Match(&sess) {
+		a.visible = append(a.visible, 0)
+		copy(a.visible[1:], a.visible[:len(a.visible)-1])
+		a.visible[0] = 0
+	}
+}
+
+// hosts returns the sidebar's host list, recomputed only when the traffic or
+// the filter changed: counting every session and sorting the result is not
+// work a frame should repeat while nothing moved.
+func (a *App) hosts() []HostCount {
+	if !a.hostsDirty && a.hostList != nil {
+		return a.hostList
+	}
+	a.hostList = a.Store.Hosts()
+	a.hostsDirty = false
+	return a.hostList
+}
 
 // Visible returns the rows the filter lets through, as indices into the store.
 func (a *App) Visible() []int {
 	if !a.visibleDirty && a.visible != nil {
 		return a.visible
 	}
-	all := a.Store.Snapshot()
-	out := make([]int, 0, len(all))
-	for i := range all {
-		if a.Filter.Match(&all[i]) {
+	// The result is kept until the data or the filter changes, because a frame
+	// asks more than once (the table, and the count in the filter bar) and a
+	// store of thousands of sessions must not be walked per ask.
+	n := a.Store.Len()
+	out := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		if sess, ok := a.Store.At(i); ok && a.Filter.Match(&sess) {
 			out = append(out, i)
 		}
 	}
@@ -223,7 +269,7 @@ func (a *App) sidebar(c *ui.Context, p *Palette) {
 		a.sidebarSection(c, p, "会话")
 		a.sidebarItem(c, p, "全部流量", a.Store.Len(), true)
 		a.sidebarSection(c, p, "域名")
-		for _, h := range a.Store.Hosts() {
+		for _, h := range a.hosts() {
 			a.sidebarItem(c, p, h.Host, h.Count, false)
 		}
 	})
