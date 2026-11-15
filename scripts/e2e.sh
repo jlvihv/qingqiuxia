@@ -26,7 +26,7 @@ echo "building"
 go build -o "$BIN" ./cmd/qingqiuxia
 
 echo "starting the core"
-"$BIN" -data "$DATA_DIR" -proxy "$PROXY_ADDR" -api "$API_ADDR" >"$LOG" 2>&1 &
+"$BIN" -headless -data "$DATA_DIR" -proxy "$PROXY_ADDR" -api "$API_ADDR" >"$LOG" 2>&1 &
 CORE_PID=$!
 for _ in $(seq 50); do
   api /api/status >/dev/null 2>&1 && break

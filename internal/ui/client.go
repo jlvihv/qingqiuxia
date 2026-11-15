@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -21,12 +22,31 @@ type Client struct {
 	http  *http.Client
 }
 
-// NewClient returns a client for a core listening at addr, as "127.0.0.1:8898".
+// NewClient returns a client for a core listening on a TCP address, as
+// "127.0.0.1:8898".
 func NewClient(addr, token string) *Client {
 	return &Client{
 		base:  "http://" + addr,
 		token: token,
 		http:  &http.Client{Timeout: 20 * time.Second},
+	}
+}
+
+// NewUnixClient returns a client for a core whose API is a unix socket, which
+// is how a window reaches the core it started itself: no port to choose, no
+// token to keep, and nothing another process can connect to.
+func NewUnixClient(path string) *Client {
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", path)
+		},
+	}
+	return &Client{
+		// The host in the URL is a placeholder: the dialer ignores it and
+		// connects to the socket.
+		base: "http://unix",
+		http: &http.Client{Transport: tr, Timeout: 20 * time.Second},
 	}
 }
 
@@ -280,8 +300,11 @@ func (c *Client) Stream(ctx context.Context, fn func(Event)) error {
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
-	// No timeout on the client for a stream: it is meant to stay open.
-	resp, err := (&http.Client{}).Do(req)
+	// No timeout on the client for a stream: it is meant to stay open, but it
+	// must use the same transport as the rest, or a unix socket would not be
+	// reached at all.
+	streamClient := &http.Client{Transport: c.http.Transport}
+	resp, err := streamClient.Do(req)
 	if err != nil {
 		return err
 	}

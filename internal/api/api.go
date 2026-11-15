@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -135,7 +136,17 @@ func (s *Server) authorized(r *http.Request) bool {
 
 // Listen starts the API on addr, which may be ":0" for any free port.
 func (s *Server) Listen(addr string) error {
-	ln, err := net.Listen("tcp", addr)
+	network := "tcp"
+	// A path, not an address: the window starts the core in its own process
+	// and reaches its API over a unix socket, which no other process on the
+	// machine can connect to and which needs no port or token. It is also
+	// gone as soon as the socket file is unlinked.
+	if strings.HasPrefix(addr, "/") || strings.HasPrefix(addr, ".") {
+		network = "unix"
+		// A socket left by a process that died would make Listen fail.
+		os.Remove(addr)
+	}
+	ln, err := net.Listen(network, addr)
 	if err != nil {
 		return err
 	}

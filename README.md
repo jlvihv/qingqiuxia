@@ -19,7 +19,8 @@
 
 ```sh
 go build -o qingqiuxia ./cmd/qingqiuxia
-./qingqiuxia                 # 代理 127.0.0.1:8899，API 127.0.0.1:8898
+./qingqiuxia                 # 核心 + 窗口
+./qingqiuxia -headless       # 只跑核心，API 在 127.0.0.1:8898
 ```
 
 首次启动会在 `~/.config/qingqiuxia/` 生成 CA。让客户端信任它，就能看到 HTTPS 明文：
@@ -35,20 +36,25 @@ curl -O http://127.0.0.1:8898/api/certificate?download=1
 然后看抓到了什么：
 
 ```sh
-curl -s 127.0.0.1:8898/api/sessions | jq '.sessions[0]'
+# 窗口模式下走 socket，-headless 模式下走 TCP
+curl -s --unix-socket ~/.config/qingqiuxia/core.sock http://unix/api/sessions | jq '.sessions[0]'
+curl -s 127.0.0.1:8898/api/sessions | jq '.sessions[0]'   # -headless
 ```
 
 ## 命令行
 
 ```
--proxy   代理监听地址（默认 127.0.0.1:8899）
--api     API 监听地址（默认 127.0.0.1:8898）
--data    CA 和规则文件所在目录（默认 ~/.config/qingqiuxia）
--token   API 令牌，默认空（只在回环地址上安全）
+-proxy    代理监听地址（默认 127.0.0.1:8899）
+-headless 只跑核心，不开窗口
+-api      -headless 时的 API 地址（默认 127.0.0.1:8898）
+-socket   窗口模式下 API 的 unix socket 路径（默认 <数据目录>/core.sock）
+-data     CA 和规则文件所在目录（默认 ~/.config/qingqiuxia）
+-token    API 令牌，默认空（只在回环地址或 socket 上安全）
 -max-body 每个 body 保留多少字节用于查看和改写（默认 4 MiB）
 -sessions 内存里保留多少条会话（默认 2000）
 -intercept 是否解密 TLS（默认 true）
--v       打印每条连接的错误
+-pprof    若设置，在这个地址上开 pprof 和 expvar
+-v        打印每条连接的错误
 ```
 
 ## API
@@ -145,27 +151,31 @@ go test ./internal/proxy -bench . -run XXX   # 基准
 - body 超过 `-max-body` 的部分不保留：会照常转发给源站，但会话里只有开头一段，并标记 `truncated`。
 - WebSocket 目前走透传，不解帧。
 
-## 桌面窗口
+## 一个进程，两个部分
 
-`cmd/qingqiuxia-gui` 是窗口，用 MyGo 的原生控件画，不跑 webview。它和核心是两个进程：窗口只是 API 的一个客户端，所以核心没窗口也照常抓包，窗口可以随时重启、或者以后换成网页版。
+`qingqiuxia` 是核心，也是窗口。它们的边界没有因此消失：**窗口通过 HTTP API 访问核心**，和任何其他客户端一样，只是走一条 unix socket，而不是 TCP 端口。
+
+这样做的取舍：
+
+- 保留了边界 —— 视图不知道代理的存在，换成网页前端也不用动核心
+- 去掉了拆分的代价 —— 不用挑端口、不用守 token、不会出现窗口活着而核心已死
+- socket 只有本进程能连，也不占端口
+
+`-headless` 只跑核心，给没有显示器的机器或 CI 用，那时 API 退回 TCP。
 
 ```sh
-go build -o bin/qingqiuxia ./cmd/qingqiuxia          # 核心
-go build -o bin/qingqiuxia-gui ./cmd/qingqiuxia-gui  # 窗口
-
-./bin/qingqiuxia &                       # 先起核心
-./bin/qingqiuxia-gui                     # 再开窗口，自动连 127.0.0.1:8898
-./bin/qingqiuxia-gui -demo               # 看假数据，不需要核心
+./qingqiuxia                          # 窗口模式，API 在 <数据目录>/core.sock
+./qingqiuxia -headless                # 只跑核心，API 在 127.0.0.1:8898
+./qingqiuxia -data /tmp/d -proxy :9999  # 换数据目录和代理端口
 ```
 
 没有显示器也能看界面，`ui.Render` 把它画成图片：
 
 ```sh
-QQX_RENDER=/tmp/window.png go test ./internal/ui -run TestRenderLayout
-QQX_API=127.0.0.1:8898 QQX_RENDER=/tmp/live.png go test ./internal/ui -run TestLiveCore
+qqx_render=/tmp/window.png go test ./internal/ui -run TestRenderLayout
 ```
 
-### 布局
+### 布局### 布局
 
 三栏加两条可拖动的分隔：侧栏（184px，域名分组）、流量表（吃剩余宽度）、详情面板（452px）。工具栏在上，状态栏在下，断点暂停时两栏之间插一条横幅——用横幅而不是弹窗，因为暂停是高频动作，弹窗会挡住判断所需的列表。
 
