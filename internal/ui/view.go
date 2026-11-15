@@ -68,6 +68,17 @@ type App struct {
 	backend Backend
 	control Control
 
+	// detail and detailID hold the chosen session's bodies, which are fetched
+	// when it is chosen and kept until another is: a list carries none, and
+	// re-fetching on every frame would be a request per frame.
+	bodies   Detail
+	detailID uint64
+	// detailErr is why the last fetch failed, empty when it did not.
+	detailErr string
+	// detailKey names the body widgets, so that switching sessions starts a
+	// body pane fresh rather than reusing the previous one's scroll.
+	detailKey uint64
+
 	// visible caches the indices the filter lets through, so that a frame
 	// does not re-filter a list of thousands twice.
 	visible      []int

@@ -8,6 +8,41 @@ import (
 	"time"
 )
 
+// Message is one side of an exchange as the detail panel shows it: the headers
+// as they went out, and the body as text where it can be read as text.
+//
+// The list never carries these: a thousand sessions with their bodies in memory
+// is most of a gigabyte, for detail that one click asks for. They are fetched
+// for the chosen session, once, and kept beside it.
+type Message struct {
+	// Headers are the message's, in the order the carrier kept them.
+	Headers []Header
+	// ContentType is the media type the panel names the body with.
+	ContentType string
+	// Body is the body as text, empty when there is none or when it is binary.
+	Body string
+	// Binary reports a body the panel cannot show as text; Size is what it
+	// weighs, so the panel can say so rather than draw nothing.
+	Binary bool
+	// Base64 is the body when Binary, for a viewer that wants to show the
+	// bytes. It is empty for a text body.
+	Base64 string
+	// Truncated reports that the core kept only the start of the body, because
+	// it was longer than the capture limit.
+	Truncated bool
+	// Streaming reports a body the core passed through without buffering, as
+	// server-sent events.
+	Streaming bool
+	// Size is the body's length as the core measured it on the wire.
+	Size int64
+}
+
+// Header is one header line, kept as a pair so the panel can show a name twice
+// when a message had it twice.
+type Header struct {
+	Name, Value string
+}
+
 // Session is one row of the traffic list, as the API describes it.
 type Session struct {
 	ID     uint64

@@ -20,7 +20,13 @@ type Backend interface {
 	Status(ctx context.Context) (Status, error)
 	// Sessions returns the traffic, newest first, and how many the core holds.
 	// A negative limit asks for all of them.
+	//
+	// The rows carry no bodies: a capture of thousands with their bodies in
+	// memory is most of a gigabyte for detail one click asks for.
 	Sessions(ctx context.Context, limit int) ([]Session, int, uint64, error)
+	// Detail returns one session's request and response bodies and headers,
+	// which Sessions deliberately left out.
+	Detail(ctx context.Context, id uint64) (Detail, error)
 	// SetCapture turns recording on or off.
 	SetCapture(ctx context.Context, on bool) error
 	// Pauses lists what is waiting at a breakpoint.
@@ -31,6 +37,12 @@ type Backend interface {
 	// window runs it in a goroutine. This is what replaces a network stream,
 	// and it carries whole values rather than JSON to encode and decode.
 	Watch(ctx context.Context, fn func(Change)) error
+}
+
+// Detail is what one session holds in full: the parts a list row leaves out.
+type Detail struct {
+	Request  Message
+	Response Message
 }
 
 // Change is one thing that happened in the core.

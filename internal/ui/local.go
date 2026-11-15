@@ -2,9 +2,17 @@ package ui
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jlvihv/qingqiuxia/internal/breakpoint"
+	"github.com/jlvihv/qingqiuxia/internal/codec"
+	"github.com/jlvihv/qingqiuxia/internal/msg"
 	"github.com/jlvihv/qingqiuxia/internal/pipeline"
 	"github.com/jlvihv/qingqiuxia/internal/proxy"
 	"github.com/jlvihv/qingqiuxia/internal/session"
@@ -221,4 +229,70 @@ func (l *Local) StartProxy(addr string) (string, error) {
 // StopProxy stops serving and releases the port.
 func (l *Local) StopProxy() error {
 	return l.Proxy.Stop()
+}
+
+// Detail returns one session's headers and bodies.
+//
+// The body is decoded for reading: what a user wants from a gzipped response is
+// the JSON inside it, not the compressed bytes. The coding is named in a header
+// the panel shows, so nothing is hidden.
+func (l *Local) Detail(_ context.Context, id uint64) (Detail, error) {
+	snap, ok := l.Pipeline.Sessions().Get(id)
+	if !ok {
+		return Detail{}, fmt.Errorf("no session %d", id)
+	}
+	var d Detail
+	if snap.Request != nil {
+		d.Request = messageOf(&snap.Request.Message)
+	}
+	if snap.Response != nil {
+		d.Response = messageOf(&snap.Response.Message)
+	}
+	return d, nil
+}
+
+// messageOf turns a message into what the panel shows.
+func messageOf(m *msg.Message) Message {
+	out := Message{
+		ContentType: m.Header.Get("Content-Type"),
+		Truncated:   m.Truncated,
+		Streaming:   m.Stream != nil,
+		Size:        int64(len(m.Body)),
+	}
+	out.Headers = headersOf(m.Header)
+	if len(m.Body) == 0 {
+		return out
+	}
+	// A body that is compressed is decoded for reading; one whose coding cannot
+	// be undone is reported as it is rather than shown as noise.
+	body := m.Body
+	if ce := m.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
+		if decoded, err := codec.Decode(body, ce); err == nil {
+			body = decoded
+		}
+	}
+	if msg.IsText(msg.MediaType(out.ContentType)) && utf8.Valid(body) {
+		out.Body = string(body)
+		return out
+	}
+	out.Binary = true
+	out.Base64 = base64.StdEncoding.EncodeToString(body)
+	return out
+}
+
+// headersOf lists a header's lines in a stable order, so a panel does not
+// reshuffle them between frames.
+func headersOf(h http.Header) []Header {
+	names := make([]string, 0, len(h))
+	for k := range h {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	out := make([]Header, 0, len(names))
+	for _, k := range names {
+		for _, v := range h[k] {
+			out = append(out, Header{Name: k, Value: v})
+		}
+	}
+	return out
 }

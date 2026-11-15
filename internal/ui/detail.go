@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/egoist/mygo/ui"
@@ -189,15 +190,46 @@ func (a *App) note(c *ui.Context, p *Palette, n Note) {
 // messagePane shows a request's or a response's headers and body.
 func (a *App) messagePane(c *ui.Context, p *Palette, sess *Session, side string) {
 	a.urlBar(c, p, sess)
-	a.section(c, p, side, false)
-	ui.Text(c, fmt.Sprintf("%s 的头和 body 来自核心 API 的会话详情。", side)).
-		FontSize(11.5).TextColor(p.TextMuted).Padding(0, 10, tokenSpace1, 0)
 
-	if side == "响应" && sess.BytesOut > 0 {
-		a.section(c, p, "Body", false)
-		ui.Text(c, "（body 由 ui/editor 渲染，这里接 API 的会话详情）").
-			FontSize(11).TextColor(p.Dim).Padding(0, 10, tokenSpace1, 0)
+	// The bodies are fetched for the chosen session, and only while a pane that
+	// shows them is open: the list carries none, because thousands of rows with
+	// their bodies is most of a gigabyte for detail one click asks for.
+	d, err := a.bodiesFor(sess.ID)
+	if err != nil {
+		a.bodyNotice(c, p, "取不到内容："+err.Error())
+		return
 	}
+	if side == "请求" {
+		a.bodyPane(c, p, &d.Request, "请求")
+		return
+	}
+	a.bodyPane(c, p, &d.Response, "响应")
+}
+
+// bodiesFor returns the chosen session's bodies, fetching them when the pane
+// first shows it.
+//
+// It asks once per session: a frame runs many times a second, and a request per
+// frame would be a request per frame. A failure is kept too, so a session the
+// core has already dropped does not retry on every frame.
+func (a *App) bodiesFor(id uint64) (Detail, error) {
+	if a.detailID == id {
+		return a.bodies, nil
+	}
+	a.detailID = id
+	a.detailKey = id
+	a.bodies = Detail{}
+	if a.backend == nil {
+		return Detail{}, nil
+	}
+	d, err := a.backend.Detail(context.Background(), id)
+	if err != nil {
+		a.detailErr = err.Error()
+		return Detail{}, err
+	}
+	a.detailErr = ""
+	a.bodies = d
+	return d, nil
 }
 
 // notesPane is the full list of what happened to a session.

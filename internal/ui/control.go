@@ -46,3 +46,10 @@ func (a *App) SetProxyError(err error) {
 	a.ProxyRunning = false
 	a.PortError = err.Error()
 }
+
+// Bodies returns the chosen session's bodies as the panes currently hold them,
+// and the id they belong to. It is what the panel drew, for a test that checks
+// the text the panes were given rather than the widget that drew them.
+func (a *App) Bodies() (Detail, uint64) {
+	return a.bodies, a.detailID
+}
