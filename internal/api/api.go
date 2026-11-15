@@ -391,11 +391,11 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	store := s.core.Pipeline.Sessions()
-	// The filter runs on the server: a caller paying for every byte it reads
-	// asks for the three rows it wants, not two hundred it must sift.
+	// 过滤在服务端做：按字节付费的调用方要的是它想要的那三行，不是两百行让它
+	// 自己去筛。
 	all := store.List(0, -1)
 	kept := make([]session.Snapshot, 0, len(all))
-	// Walk newest first, which is the order a traffic list shows.
+	// 最新的在前，这也是流量列表的顺序。
 	for i := len(all) - 1; i >= 0; i-- {
 		if f.matches(&all[i]) {
 			kept = append(kept, all[i])
@@ -424,17 +424,15 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// tableColumns are the columns shape=table can carry, in the order they are
-// written when a caller does not choose.
+// tableColumns 是 shape=table 能带的列，也是调用方不指定时的默认顺序。
 var tableColumns = []string{
 	"id", "method", "status", "ms", "host", "url", "size", "source", "phase",
 }
 
-// writeTable answers with rows as arrays under a header.
+// writeTable 用一个表头加数组行来回答。
 //
-// An object per row repeats its keys on every row; two hundred rows of
-// {"id":1,"method":"GET",...} is about 40% more bytes than the same data as
-// arrays, which matters when the reader is paying for context.
+// 每行一个对象意味着每行都重复一遍键名；两百行 {"id":1,"method":"GET",...}
+// 比同样的数据用数组写要多约 40% 字节，而读的人是按上下文付费的。
 func writeTable(w http.ResponseWriter, f listFilter, list []session.Snapshot, total int, dropped uint64) {
 	cols := f.fields
 	if len(cols) == 0 {
@@ -452,7 +450,7 @@ func writeTable(w http.ResponseWriter, f listFilter, list []session.Snapshot, to
 	})
 }
 
-// tableRow renders one session as the values of the named columns.
+// tableRow 把一条会话渲染成指定列的值。
 func tableRow(s *session.Snapshot, cols []string) []any {
 	row := make([]any, len(cols))
 	for i, c := range cols {
@@ -482,7 +480,7 @@ func tableRow(s *session.Snapshot, cols []string) []any {
 	return row
 }
 
-// statusOf is the response's status, or 0 while there is none.
+// statusOf 是响应的状态码，还没有响应时是 0。
 func statusOf(s *session.Snapshot) int {
 	if s.Response != nil {
 		return s.Response.Status
@@ -490,7 +488,7 @@ func statusOf(s *session.Snapshot) int {
 	return 0
 }
 
-// round1 rounds to one decimal, which is all a millisecond figure needs.
+// round1 保留一位小数，毫秒数这样够了。
 func round1(v float64) float64 {
 	return float64(int(v*10+0.5)) / 10
 }
@@ -500,14 +498,11 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// A caller usually wants one part of an exchange, not all of it: "why did
-	// this answer 500" is the summary and the response body, and the request
-	// headers are noise. The parts are named so that a body of half a megabyte
-	// is not sent to someone who asked about timings.
+	// 调用方通常只要一次请求的一部分："为什么 500"要的是摘要和响应体，请求头
+	// 是噪音。分块的意义就在于，问耗时的人不会收到半个兆的 body。
 	//
-	// The part is checked before the session is looked up: a bad argument is a
-	// bad argument whether or not that id exists, and answering 404 for it sends
-	// the caller looking in the wrong place.
+	// 先查 part 再查会话：参数写错就是参数写错，跟那个 id 存不存在无关；为它
+	// 回 404 会让人去查错地方。
 	q := r.URL.Query()
 	part := q.Get("part")
 	if part == "" {
@@ -549,7 +544,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// headersOnly describes a message's headers without its body.
+// headersOnly 只描述头部，不带 body。
 func headersOnly(m *msg.Message, _ int) *messageJSON {
 	if m == nil {
 		return nil
@@ -562,14 +557,14 @@ func headersOnly(m *msg.Message, _ int) *messageJSON {
 	}
 }
 
-// truncateBodies cuts a body to at most n bytes, saying that it did: a body
-// that stops early without saying so reads as a broken tool.
+// truncateBodies 把 body 截到 n 字节，并且标明截断了：悄悄少一截的 body 会
+// 让人以为工具坏了。
 func truncateBodies(m *messageJSON, n int) {
 	if m == nil || len(m.Body) <= n {
 		return
 	}
-	// The body may be base64, which does not cut on a byte boundary; cutting
-	// the text is enough for a reader, and the size is in the row anyway.
+	// body 可能已经是 base64，按字节切会切断编码。对读的人来说切文本就够了，
+	// 真实大小本来也在行里。
 	m.Body = m.Body[:n]
 	m.Truncated = true
 }
