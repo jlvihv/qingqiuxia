@@ -67,6 +67,10 @@ type App struct {
 	// backend and control are the core, as the command passed it.
 	backend Backend
 	control Control
+	// OnRowBuilt, when set, is called for every row the table asks the app to
+	// build. It exists so a test can check the table asks for the rows that
+	// exist and no more.
+	OnRowBuilt func(row int)
 
 	// detail and detailID hold the chosen session's bodies, which are fetched
 	// when it is chosen and kept until another is: a list carries none, and
@@ -160,16 +164,27 @@ func (a *App) Invalidate() {
 }
 
 // InvalidateAppend tells the app one session was added at the newest end,
-// which is the case for every arriving request.
+// which is the shape of an arriving request.
 //
 // It extends the filtered rows instead of refiltering them: a burst of requests
 // is what a proxy produces, and walking thousands of rows per arrival is what
-// makes a live list stutter. A changed filter still refilters, and so does a
-// session that arrives again with new contents.
-func (a *App) InvalidateAppend() {
+// makes a live list stutter.
+//
+// It is only valid for an arrival. The core publishes a session twice — once
+// when it starts and once when it ends — and an update is not an arrival: it
+// rewrites a row where it is. Calling this for one shifted every row by a place
+// and put a zero at the front, so a list of six grew a second band of six rows
+// that held nothing and still took the pointer.
+func (a *App) InvalidateAppend(id uint64) {
 	a.hostsDirty = true
 	if a.visibleDirty || a.visible == nil {
 		// The rows are stale for another reason; the next Visible sorts it out.
+		return
+	}
+	// The new session is the one at the front now, and the caller passes the id
+	// it recorded: an update of an older session leaves the rows alone.
+	newest, ok := a.Store.At(0)
+	if !ok || newest.ID != id {
 		return
 	}
 	// A row is its distance from the newest session, so a new one at the front
@@ -177,7 +192,7 @@ func (a *App) InvalidateAppend() {
 	for i := range a.visible {
 		a.visible[i]++
 	}
-	if sess, ok := a.Store.At(0); ok && a.Filter.Match(&sess) {
+	if a.Filter.Match(&newest) {
 		a.visible = append(a.visible, 0)
 		copy(a.visible[1:], a.visible[:len(a.visible)-1])
 		a.visible[0] = 0
@@ -510,12 +525,22 @@ func (a *App) table(c *ui.Context, p *Palette) {
 	// A row's identity is its session ID, so that the chosen row stays chosen
 	// as new traffic arrives above it.
 	a.list.Key = func(row int) any {
+		// A row past the filtered set has no session; its key must still be
+		// stable and distinct, or the table's row state (the choice, the
+		// pointer) lands on the wrong row. Indexing rows[row] unguarded would
+		// panic there instead.
+		if row < 0 || row >= len(rows) {
+			return negativeKey(row)
+		}
 		if sess, ok := a.Store.At(rows[row]); ok {
 			return sess.ID
 		}
-		return row
+		return negativeKey(row)
 	}
 	ui.Table(c, a.list, columns, len(rows), func(row, col int) {
+		if row < 0 || row >= len(rows) {
+			return
+		}
 		sess, ok := a.Store.At(rows[row])
 		if !ok {
 			return
@@ -523,6 +548,9 @@ func (a *App) table(c *ui.Context, p *Palette) {
 		// A chosen row keeps its colours: the selection is a subdued fill
 		// behind the text, not a different palette. A status code stays red
 		// when chosen, which is the whole point of colouring it.
+		if a.OnRowBuilt != nil {
+			a.OnRowBuilt(row)
+		}
 		chosen := row == a.Selected
 		fg := func(normal ui.Color) ui.Color { return normal }
 		switch col {
@@ -586,3 +614,7 @@ func (a *App) badge(c *ui.Context, p *Palette, text string, colour ui.Color) {
 }
 
 var _ = ui.Column
+
+// negativeKey is a row key for a row that has no session, kept out of the range
+// sessions use so it cannot collide with one.
+func negativeKey(row int) int { return -1 - row }

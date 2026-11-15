@@ -27,7 +27,7 @@ func TestSelectionFollowsItsRow(t *testing.T) {
 	// A new session arrives at the newest end.
 	store.Upsert(qqx.Session{ID: 99, Phase: "complete", Method: "GET", Status: 200,
 		URL: "https://api.test/v1/new", Host: "api.test"})
-	app.InvalidateAppend()
+	app.InvalidateAppend(99)
 	tt.Frame()
 
 	after, ok := app.SelectedSession()

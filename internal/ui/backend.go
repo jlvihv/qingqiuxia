@@ -49,6 +49,12 @@ type Detail struct {
 type Change struct {
 	// Session is the session that changed, set for ChangeSession.
 	Session *Session
+	// Added reports that ChangeSession is a session arriving for the first
+	// time, rather than one that was already in the list and has changed. The
+	// core publishes a session twice, when it starts and when it ends, and only
+	// the first is an arrival: a list that treated both as arrivals grew a
+	// second band of empty rows.
+	Added bool
 	// Pause is the message that stopped or resumed, set for the pause kinds.
 	Pause *Pause
 	// Kind says which of the above is set.

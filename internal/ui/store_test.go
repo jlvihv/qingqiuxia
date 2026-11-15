@@ -98,9 +98,9 @@ func TestInvalidateAppend(t *testing.T) {
 
 	// One arrives that matches, then one that does not.
 	s.Upsert(qqx.Session{ID: 6, Method: "GET", URL: "https://a.test/keep", Host: "a.test"})
-	app.InvalidateAppend()
+	app.InvalidateAppend(6)
 	s.Upsert(qqx.Session{ID: 7, Method: "GET", URL: "https://a.test/skip", Host: "a.test"})
-	app.InvalidateAppend()
+	app.InvalidateAppend(7)
 	fast := append([]int(nil), app.Visible()...)
 
 	// What a full pass would give.

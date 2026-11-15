@@ -183,7 +183,7 @@ func (l *Local) Watch(ctx context.Context, fn func(Change)) error {
 			if ev.Kind == session.EventDropped {
 				kind = ChangeDropped
 			}
-			fn(Change{Kind: kind, Session: &sess})
+			fn(Change{Kind: kind, Session: &sess, Added: ev.Kind == session.EventNew})
 		case ev, ok := <-pauseC:
 			if !ok {
 				return nil

@@ -400,7 +400,12 @@ func follow(ctx context.Context, local *qqx.Local, store *qqx.Store, app *qqx.Ap
 					store.Upsert(*ch.Session)
 				}
 				mygo.RunOnMain(func() {
-					app.InvalidateAppend()
+					if ch.Added && ch.Session != nil {
+						app.InvalidateAppend(ch.Session.ID)
+					} else {
+						// An update rewrites a row where it is; nothing moves.
+						app.Invalidate()
+					}
 					invalidate()
 				})
 			case qqx.ChangeDropped:
