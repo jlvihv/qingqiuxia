@@ -21,6 +21,9 @@ type Action interface {
 	apply(req *msg.Request, resp *msg.Response) (changed bool, err error)
 	// describe names the action for the API and for a session's notes.
 	describe() string
+	// spec returns the action as it was written, so a rule can be read back and
+	// written again rather than only described.
+	spec() (ActionSpec, bool)
 }
 
 // ActionSpec is an action as it is written in the rules file and the API.
@@ -212,7 +215,9 @@ func (a *setBody) apply(req *msg.Request, resp *msg.Response) (bool, error) {
 	return true, setEncodedBody(m, []byte(a.value))
 }
 
-func (a *setBody) describe() string { return "set-body" }
+func (a *setBody) describe() string {
+	return fmt.Sprintf("set-body %d 字节", len(a.value))
+}
 
 // replaceBody rewrites the decoded body text with a regular expression
 // substitution, then restores the message's content coding.
@@ -259,7 +264,9 @@ func (a *replaceBody) bodyText(m *msg.Message) ([]byte, bool) {
 	return decoded, true
 }
 
-func (a *replaceBody) describe() string { return "replace-body /" + a.find + "/" }
+func (a *replaceBody) describe() string {
+	return "replace-body /" + a.find + "/ → " + a.replace
+}
 
 // expand turns a replacement string's \1 and $1 into regexp's form, so that
 // users may write whichever they are used to.
@@ -337,4 +344,38 @@ func JSONBody(v any) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// spec returns the action as it was written, so that a rule can be read back and
+// edited rather than only described.
+func (a *setURL) spec() (ActionSpec, bool) {
+	return ActionSpec{Type: "set-url", Value: a.value}, true
+}
+
+func (a *setQuery) spec() (ActionSpec, bool) {
+	return ActionSpec{Type: "set-query", Name: a.name, Value: a.value}, true
+}
+
+func (a *setHeader) spec() (ActionSpec, bool) {
+	return ActionSpec{Type: "set-header", Name: a.name, Value: a.value}, true
+}
+
+func (a *removeHeader) spec() (ActionSpec, bool) {
+	return ActionSpec{Type: "remove-header", Name: a.name}, true
+}
+
+func (a *setBody) spec() (ActionSpec, bool) {
+	return ActionSpec{Type: "set-body", Value: a.value, ContentType: a.contentType}, true
+}
+
+func (a *replaceBody) spec() (ActionSpec, bool) {
+	return ActionSpec{Type: "replace-body", Find: a.find, Replace: a.replace}, true
+}
+
+func (a *setStatus) spec() (ActionSpec, bool) {
+	return ActionSpec{Type: "set-status", Status: a.status}, true
+}
+
+func (a *redirect) spec() (ActionSpec, bool) {
+	return ActionSpec{Type: "redirect", Value: a.location, Status: a.status}, true
 }

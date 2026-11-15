@@ -24,26 +24,18 @@ func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {
 }
 
 // ruleView is how the API shows a rule.
+//
+// It carries both what a reader wants and what a writer needs: Effects is a
+// sentence for a person or a model reading a list, and Spec is the rule as it
+// was written, so that a caller can change one field and write it back. Without
+// the second, reading a rule is not enough to edit it.
 type ruleView struct {
-	ID      uint64   `json:"id"`
-	Name    string   `json:"name"`
-	Enabled bool     `json:"enabled"`
-	Kind    string   `json:"kind"`
-	Phase   string   `json:"phase"`
-	Pattern string   `json:"pattern"`
+	rule.Spec
 	Effects []string `json:"effects,omitempty"`
 }
 
 func toRuleView(r *rule.Rule) ruleView {
-	return ruleView{
-		ID:      r.ID,
-		Name:    r.Name,
-		Enabled: r.Enabled,
-		Kind:    r.Kind.String(),
-		Phase:   r.Phase.String(),
-		Pattern: r.Matcher.String(),
-		Effects: r.Describe(),
-	}
+	return ruleView{Spec: r.Spec(), Effects: r.Describe()}
 }
 
 // handleReplaceRules swaps the whole rule set, which is how a GUI reorders
@@ -64,6 +56,25 @@ func (s *Server) handleReplaceRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handleListRules(w, r)
+}
+
+// handleGetRule returns one rule, which a caller reads before changing it.
+func (s *Server) handleGetRule(w http.ResponseWriter, r *http.Request) {
+	e := s.ruleEngine(w)
+	if e == nil {
+		return
+	}
+	id, ok := ruleID(w, r)
+	if !ok {
+		return
+	}
+	for _, rr := range e.Rules() {
+		if rr.ID == id {
+			writeJSON(w, http.StatusOK, toRuleView(rr))
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "没有这个 id 的规则")
 }
 
 // handleAddRule appends one rule.

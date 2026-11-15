@@ -50,7 +50,13 @@ const indexText = `请求侠 (qingqiuxia) 控制接口
   part=body        只有 body，已解码，可以直接读
   max=2000         每个 body 最多取多少字节
 
-== 改变流量 ==
+== 改流量：两种东西，别混 ==
+
+  /api/rules       就叫「规则」：mock（直接返回）、rewrite（改写）、abort（拒绝）
+  /api/breakpoints 叫「断点规则」：把流量停下来等人决定
+
+两者都能按 URL 匹配，但语义完全不同：规则自动生效、不管人；断点会暂停，必须
+有人放行或拒绝。看名字分不清时，看这里。
 
 规则作用于之后进来的流量：请求进来时匹配一次，响应回来时再匹配一次，改完照原
 路返回。已经抓到的记录是历史，规则不会回头去改它 —— 界面上看到的那条记录，永
@@ -75,9 +81,13 @@ const indexText = `请求侠 (qingqiuxia) 控制接口
     "name":"打码","kind":"rewrite","phase":"response","pattern":"*",
     "actions":[{"type":"replace-body","find":"secret","replace":"***"}]}'
 
-  GET    API/api/rules            列出全部
+  GET    API/api/rules            列出全部（每条都带 actions，能原样读回）
+  GET    API/api/rules/ID         只看一条：改之前先读它
   PATCH  API/api/rules/ID         {"enabled":false} 停用某条
   DELETE API/api/rules/ID         删除
+
+  列表里每条有两部分：actions 是规则本身（能读出来改一个字段再写回去），
+  effects 是一句人话，说明它实际会做什么。
 
 改写动作：set-url、set-query、set-header、remove-header、set-body、
 replace-body、set-status、redirect。

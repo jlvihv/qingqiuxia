@@ -173,6 +173,47 @@ func guessContentType(body string) string {
 	return "text/plain; charset=utf-8"
 }
 
+// Spec returns the rule as the API describes it, so that a caller can read a
+// rule, change one field, and write it back: a list of effects is readable but
+// cannot be round-tripped.
+func (r *Rule) Spec() Spec {
+	s := Spec{
+		ID:       r.ID,
+		Name:     r.Name,
+		Kind:     r.Kind.String(),
+		Phase:    r.Phase.String(),
+		Pattern:  r.Matcher.String(),
+		Priority: r.Priority,
+	}
+	enabled := r.Enabled
+	s.Enabled = &enabled
+	if r.delay > 0 {
+		s.Delay = int(r.delay / time.Millisecond)
+	}
+	for _, a := range r.actions {
+		if spec, ok := a.spec(); ok {
+			s.Actions = append(s.Actions, spec)
+		}
+	}
+	if r.mock != nil {
+		s.Mock = &MockSpec{
+			Status:      r.mock.Status,
+			Headers:     map[string]string{},
+			Body:        string(r.mock.Body),
+			ContentType: r.mock.Header.Get("Content-Type"),
+		}
+		for k, v := range r.mock.Header {
+			if k == "Content-Type" || k == "Content-Length" {
+				continue
+			}
+			if len(v) > 0 {
+				s.Mock.Headers[k] = v[0]
+			}
+		}
+	}
+	return s
+}
+
 // Describe returns the rule's actions as human-readable text, for the API.
 func (r *Rule) Describe() []string {
 	if len(r.actions) == 0 {
