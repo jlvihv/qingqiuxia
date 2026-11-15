@@ -1,0 +1,275 @@
+package ui
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Session is one row of the traffic list, as the API describes it.
+type Session struct {
+	ID     uint64
+	Phase  string // pending, complete, failed
+	Source string // proxied, mocked, aborted
+	Method string
+	URL    string
+	Host   string
+	Proto  string
+	Status int
+	Error  string
+
+	DurationMS float64
+	TTFBMS     float64
+	DNSMS      float64
+	ConnectMS  float64
+	TLSMS      float64
+
+	BytesIn  int64
+	BytesOut int64
+	Started  time.Time
+
+	// Notes explain what the pipeline did to this session, which the detail
+	// panel shows: a request that looks odd should say why.
+	Notes []Note
+}
+
+// Note is one thing the pipeline did to a session.
+type Note struct {
+	At   time.Time
+	Rule string
+	Kind string
+	Text string
+}
+
+// Path is the URL's path with its query, which the list shows on its own so
+// that a long host does not push the interesting part out of view.
+func (s *Session) Path() string {
+	if s.URL == "" {
+		return ""
+	}
+	rest := s.URL
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	}
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[i:]
+	}
+	return "/"
+}
+
+// Done reports whether the session has an outcome.
+func (s *Session) Done() bool { return s.Phase != "pending" }
+
+// Size renders the response size the way the list column does.
+func (s *Session) Size() string { return formatBytes(s.BytesOut) }
+
+// Duration renders the whole exchange, or a dash while it is in flight.
+func (s *Session) Duration() string {
+	if !s.Done() {
+		return "—"
+	}
+	return formatMillis(s.DurationMS)
+}
+
+// formatBytes shortens a size to at most four characters and a unit.
+func formatBytes(n int64) string {
+	switch {
+	case n <= 0:
+		return "0"
+	case n < 1024:
+		return fmt.Sprint(n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1fk", float64(n)/1024)
+	case n < 1024*1024*1024:
+		return fmt.Sprintf("%.1fM", float64(n)/(1024*1024))
+	}
+	return fmt.Sprintf("%.1fG", float64(n)/(1024*1024*1024))
+}
+
+// formatMillis renders a duration in the list's units: microseconds below a
+// millisecond, then milliseconds, then seconds.
+func formatMillis(ms float64) string {
+	switch {
+	case ms < 1:
+		return fmt.Sprintf("%.0fµs", ms*1000)
+	case ms < 1000:
+		return fmt.Sprintf("%.0fms", ms)
+	}
+	return fmt.Sprintf("%.2fs", ms/1000)
+}
+
+// Store holds the sessions the window shows, newest first, and the selection.
+//
+// The core publishes changes on a stream; this is the window's own copy, so a
+// frame never waits on the network.
+type Store struct {
+	mu       sync.Mutex
+	sessions []Session
+	byID     map[uint64]int
+	limit    int
+	// total counts what the core holds, which is more than the window keeps.
+	total   int
+	dropped uint64
+}
+
+// NewStore returns a store that keeps at most limit sessions.
+func NewStore(limit int) *Store {
+	if limit <= 0 {
+		limit = 5000
+	}
+	return &Store{byID: make(map[uint64]int, limit), limit: limit}
+}
+
+// Upsert records a session, replacing the row with its ID if it is there.
+// A session arrives twice: once when it starts and once when it ends.
+func (s *Store) Upsert(sess Session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if i, ok := s.byID[sess.ID]; ok {
+		s.sessions[i] = sess
+		return
+	}
+	// The list is newest first, so a new session goes to the front.
+	s.sessions = append(s.sessions, Session{})
+	copy(s.sessions[1:], s.sessions[:len(s.sessions)-1])
+	s.sessions[0] = sess
+	s.reindexLocked()
+	if len(s.sessions) > s.limit {
+		s.sessions = s.sessions[:s.limit]
+		s.reindexLocked()
+	}
+}
+
+// reindexLocked rebuilds the ID index; called after a shift or a trim.
+func (s *Store) reindexLocked() {
+	clear(s.byID)
+	for i := range s.sessions {
+		s.byID[s.sessions[i].ID] = i
+	}
+}
+
+// Remove forgets a session, which the core dropped from its ring.
+func (s *Store) Remove(id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i, ok := s.byID[id]
+	if !ok {
+		return
+	}
+	s.sessions = append(s.sessions[:i], s.sessions[i+1:]...)
+	s.reindexLocked()
+}
+
+// SetCounts records how many the core holds and how many it dropped.
+func (s *Store) SetCounts(total int, dropped uint64) {
+	s.mu.Lock()
+	s.total, s.dropped = total, dropped
+	s.mu.Unlock()
+}
+
+// Counts reports the core's total and how many sessions it dropped.
+func (s *Store) Counts() (total int, dropped uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.total, s.dropped
+}
+
+// Len reports how many sessions the window holds.
+func (s *Store) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sessions)
+}
+
+// At returns the session at a row.
+func (s *Store) At(row int) (Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if row < 0 || row >= len(s.sessions) {
+		return Session{}, false
+	}
+	return s.sessions[row], true
+}
+
+// Clear empties the window's list.
+func (s *Store) Clear() {
+	s.mu.Lock()
+	s.sessions = nil
+	clear(s.byID)
+	s.mu.Unlock()
+}
+
+// Snapshot returns every session, newest first, for a caller that iterates a
+// stable copy.
+func (s *Store) Snapshot() []Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Session, len(s.sessions))
+	copy(out, s.sessions)
+	return out
+}
+
+// Filter narrows the list. The empty filter matches everything.
+type Filter struct {
+	// Text is matched against the whole URL, without regard to case.
+	Text string
+	// Hosts, when not empty, restricts the list to those hosts.
+	Hosts []string
+}
+
+// Match reports whether a session passes the filter.
+func (f Filter) Match(s *Session) bool {
+	if f.Text != "" {
+		needle := strings.ToLower(f.Text)
+		if !strings.Contains(strings.ToLower(s.URL), needle) &&
+			!strings.Contains(strings.ToLower(s.Method), needle) &&
+			!strings.Contains(fmt.Sprint(s.Status), needle) {
+			return false
+		}
+	}
+	if len(f.Hosts) > 0 {
+		for _, h := range f.Hosts {
+			if strings.EqualFold(h, s.Host) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// HostCount is one entry of the sidebar's host list.
+type HostCount struct {
+	Host  string
+	Count int
+}
+
+// Hosts returns the hosts the window has seen, most used first, which is what
+// the sidebar lists to narrow the traffic by.
+func (s *Store) Hosts() []HostCount {
+	s.mu.Lock()
+	counts := make(map[string]int, 16)
+	for i := range s.sessions {
+		if h := s.sessions[i].Host; h != "" {
+			counts[h]++
+		}
+	}
+	s.mu.Unlock()
+
+	out := make([]HostCount, 0, len(counts))
+	for h, n := range counts {
+		out = append(out, HostCount{Host: h, Count: n})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Host < out[j].Host
+	})
+	if len(out) > 12 {
+		out = out[:12]
+	}
+	return out
+}

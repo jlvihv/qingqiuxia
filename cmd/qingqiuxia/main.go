@@ -121,6 +121,7 @@ func buildCore(cfg config) (*core, error) {
 		// sessions while the proxy keeps forwarding.
 		SetCapture: pol.SetRecording,
 		Repeat:     repeater(pr),
+		Resources:  api.ProcessResources,
 		Logger:     log.Default(),
 	}, api.Options{Token: cfg.token})
 	if err := server.Listen(cfg.apiAddr); err != nil {

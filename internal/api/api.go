@@ -42,6 +42,9 @@ type Core struct {
 	Started time.Time
 	// Repeat re-sends a recorded request, as a capture tool's replay does.
 	Repeat func(s session.Snapshot, count int, delay, interval time.Duration)
+	// Resources reports the process's resident memory in megabytes and its
+	// goroutine count, for the window's status bar.
+	Resources func() (memoryMB uint64, goroutines int)
 	// Logger receives the API's request failures; nil is silent.
 	Logger *log.Logger
 }
@@ -194,6 +197,11 @@ type status struct {
 	Paused     int    `json:"paused"`
 	Certs      int    `json:"cachedCertificates"`
 	Started    string `json:"started"`
+	// MemoryMB and Goroutines describe the process, which the window shows in
+	// its status bar: a user looking at a permanent daemon wants to know what
+	// it costs.
+	MemoryMB   uint64 `json:"memoryMb"`
+	Goroutines int    `json:"goroutines"`
 }
 
 // APIVersion is the version of the JSON API, bumped when a field changes
@@ -212,6 +220,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.core.CaptureOn != nil {
 		st.Capturing = s.core.CaptureOn()
+	}
+	if s.core.Resources != nil {
+		st.MemoryMB, st.Goroutines = s.core.Resources()
 	}
 	if p := s.core.Pipeline; p != nil {
 		st.Sessions = p.Sessions().Len()
