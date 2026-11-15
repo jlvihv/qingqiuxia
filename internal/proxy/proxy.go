@@ -244,17 +244,31 @@ func (p *Proxy) Stop() error {
 	p.ln = nil
 	p.addr = ""
 	p.started.Store(false)
+	// The connections are collected here and closed after the lock is
+	// released: closing one runs trackedConn.Close, which takes this same lock
+	// to remove itself from the set. Doing it under the lock deadlocks, and a
+	// deadlocked stop holds the proxy's port for ever.
+	conns := make([]net.Conn, 0, len(p.active))
+	for c := range p.active {
+		conns = append(conns, c)
+	}
+	transports := make([]*http.Transport, 0, len(p.transports))
+	for _, t := range p.transports {
+		transports = append(transports, t)
+	}
+	p.active = make(map[net.Conn]struct{})
+	p.transports = make(map[string]*http.Transport, 2)
+	p.mu.Unlock()
+
 	// Connections are cut rather than waited for: a proxy holding a client's
 	// keep-alive open would otherwise keep the port for as long as the client
 	// cares, and stopping is a decision the user already made.
-	for c := range p.active {
+	for _, c := range conns {
 		c.Close()
 	}
-	p.active = make(map[net.Conn]struct{})
-	for _, t := range p.transports {
+	for _, t := range transports {
 		t.CloseIdleConnections()
 	}
-	p.mu.Unlock()
 
 	var err error
 	if srv != nil {

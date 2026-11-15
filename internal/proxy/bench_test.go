@@ -1,8 +1,6 @@
-package proxy
+package proxy_test
 
 import (
-	"context"
-	"crypto/tls"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,25 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jlvihv/qingqiuxia/internal/msg"
+	"github.com/jlvihv/qingqiuxia/internal/proxy"
 )
-
-// noopPolicy is the cheapest policy a proxy can have, so the benchmark
-// measures the proxy's own overhead.
-type noopPolicy struct{}
-
-func (noopPolicy) Begin(ex *Exchange) {}
-func (noopPolicy) Request(_ context.Context, _ *Exchange) (Decision, error) {
-	return Decision{}, nil
-}
-func (noopPolicy) Response(_ context.Context, _ *Exchange, r *msg.Response) (*msg.Response, error) {
-	return r, nil
-}
-func (noopPolicy) Complete(*Exchange, *msg.Response, error) {}
-func (noopPolicy) Intercepts(string) bool                   { return false }
-func (noopPolicy) Certificate(string) (*tls.Certificate, error) {
-	return nil, nil
-}
 
 func BenchmarkPlainHTTP(b *testing.B) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +17,7 @@ func BenchmarkPlainHTTP(b *testing.B) {
 	}))
 	defer origin.Close()
 
-	p := New(noopPolicy{}, Tuning{})
+	p := proxy.New(noopPolicy{}, proxy.Tuning{})
 	if _, err := p.Start("127.0.0.1:0"); err != nil {
 		b.Fatal(err)
 	}
@@ -67,7 +48,7 @@ func BenchmarkCaptureLargeBody(b *testing.B) {
 	}))
 	defer origin.Close()
 
-	p := New(noopPolicy{}, Tuning{MaxBodyBytes: 1 << 20})
+	p := proxy.New(noopPolicy{}, proxy.Tuning{MaxBodyBytes: 1 << 20})
 	if _, err := p.Start("127.0.0.1:0"); err != nil {
 		b.Fatal(err)
 	}

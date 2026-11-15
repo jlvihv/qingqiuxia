@@ -205,17 +205,22 @@ func buildCore(cfg config) (*core, error) {
 		SetCapture: pol.SetRecording,
 		Repeat:     repeater(pr),
 		Resources:  api.ProcessResources,
-		Logger:     log.Default(),
+		Proxy: &proxyControl{
+			start:  pr.Start,
+			stop:   pr.Stop,
+			status: func() (bool, string) { return pr.Running(), pr.Addr() },
+		},
+		Logger: log.Default(),
 	}, api.Options{Token: cfg.token})
 
-	// The API is a network service only when the core has no window: then a
-	// script or a browser is the client. With a window, the window calls the
-	// core directly, in this process, and no port is opened at all.
-	if cfg.headless {
-		if err := server.Listen(cfg.apiAddr); err != nil {
-			pr.Close()
-			return nil, fmt.Errorf("listen on %s: %w", cfg.apiAddr, err)
-		}
+	// The control API always runs. It is not a fallback for having no window:
+	// it is the core's management face, and it is the only way to reach the
+	// core from another process — a script, a browser, or the window of a
+	// second machine. The window does not need it (it calls the core
+	// directly), and that is exactly why its presence costs nothing.
+	if err := server.Listen(cfg.apiAddr); err != nil {
+		pr.Close()
+		return nil, fmt.Errorf("control API on %s: %w", cfg.apiAddr, err)
 	}
 	return &core{proxy: pr, server: server, pipeline: pol, cfg: cfg}, nil
 }
@@ -223,14 +228,13 @@ func buildCore(cfg config) (*core, error) {
 // log says where the proxy is and what to install.
 func (c *core) log() {
 	log.Printf("qingqiuxia %s", version)
+	// The two interfaces, named so that they cannot be mistaken for each other.
 	if addr := c.proxy.Addr(); addr != "" {
-		log.Printf("proxy   http://%s  (set this as your HTTP and HTTPS proxy)", addr)
+		log.Printf("proxy   http://%s  (point your client's proxy here)", addr)
 	} else {
-		log.Printf("proxy   stopped; choose a port in the window")
+		log.Printf("proxy   stopped; start it from the window or POST /api/proxy/start")
 	}
-	if c.cfg.headless {
-		log.Printf("api     http://%s/api/status", c.server.Addr())
-	}
+	log.Printf("control http://%s/api/status  (the tool's API, not the proxy)", c.server.Addr())
 	log.Printf("ca      %s", filepath.Join(c.cfg.dataDir, "ca.crt"))
 	log.Printf("install the CA certificate in your client to see HTTPS traffic")
 }
@@ -267,6 +271,15 @@ func (c *core) serveWithWindow() error {
 			serveProfiling(c.cfg.pprofAddr)
 		}()
 	}
+
+	// The control API is a listener like the proxy is, and a listener that is
+	// not served accepts connections and answers none: the window does not need
+	// it, so forgetting this went unnoticed until a script tried.
+	go func() {
+		if err := c.server.Serve(); err != nil {
+			log.Printf("control API stopped: %v", err)
+		}
+	}()
 
 	local := &qqx.Local{
 		Pipeline: c.pipeline,
@@ -509,3 +522,18 @@ func loadRules(dir string, e *rule.Engine) error {
 	log.Printf("loaded %d rules from %s", len(specs), path)
 	return nil
 }
+
+// proxyControl adapts the proxy to the control API's ProxyController, which is
+// what lets a script start and stop the proxy without the API importing the
+// proxy package.
+type proxyControl struct {
+	start  func(addr string) (string, error)
+	stop   func() error
+	status func() (bool, string)
+}
+
+func (p *proxyControl) ProxyStatus() (bool, string) { return p.status() }
+func (p *proxyControl) StartProxy(addr string) (string, error) {
+	return p.start(addr)
+}
+func (p *proxyControl) StopProxy() error { return p.stop() }

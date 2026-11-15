@@ -46,6 +46,11 @@ type Core struct {
 	// Resources reports the process's resident memory in megabytes and its
 	// goroutine count, for the window's status bar.
 	Resources func() (memoryMB uint64, goroutines int)
+	// Proxy steers the proxy's own listener. It is what the control API offers
+	// on /api/proxy, and it is separate from the traffic side: the proxy's
+	// address is what a client is pointed at, while this API is what a tool
+	// talks to, and the two live and die independently.
+	Proxy ProxyController
 	// Logger receives the API's request failures; nil is silent.
 	Logger *log.Logger
 }
@@ -104,6 +109,9 @@ func (s *Server) routes() {
 
 	// Certificate.
 	s.mux.HandleFunc("GET /api/certificate", s.handleCertificate)
+
+	// The proxy's own listener, which is not this one.
+	s.proxyRoutes()
 }
 
 // ServeHTTP applies the token check and then the routes.

@@ -186,17 +186,46 @@ type Backend interface {
 
 命令行也可以直接给地址：`./qingqiuxia -proxy 127.0.0.1:8899`。
 
-### headless
+### 两种接口
 
-`-headless` 只跑核心，不开窗口，这时才启用 HTTP API（TCP），给没有显示器的机器或 CI 用：
+核心对外有两个**互相独立**的接口，别把它们混为一谈：
+
+| | 代理接口 | 控制接口 |
+|---|---|---|
+| 是什么 | HTTP 代理，转发真实流量 | HTTP API，回答状态、接受指令 |
+| 谁连 | 被调试的客户端（浏览器 / App / curl） | GUI、脚本、浏览器 |
+| 默认 | **不启动**，用户指定端口 | 随核心启动 |
+| 生命周期 | 随时启停、随时换端口 | 核心活着就在 |
+
+它们分开是因为服务和生命周期都不同：客户端在录制开关切换时一直连着代理；而脚本在代理**停着**的时候就要能调控制接口——那正是它最有用的时刻（启动代理、选端口、读上一次为什么失败）。把控制接口挂在代理的生命周期上，等于代理停着时就没法把它启动了。
 
 ```sh
-./qingqiuxia -headless                        # 核心 + API 127.0.0.1:8898
-./qingqiuxia -headless -proxy 127.0.0.1:8899  # 顺带把代理也起来
-curl -s 127.0.0.1:8898/api/sessions | jq .
+# 控制接口：代理现在什么状态
+curl -s 127.0.0.1:8898/api/proxy
+# {"running":false}
+
+# 通过控制接口启动代理，端口自己挑
+curl -s -X POST 127.0.0.1:8898/api/proxy/start \
+  -H 'Content-Type: application/json' -d '{"addr":"8899"}'
+# {"running":true,"addr":"127.0.0.1:8899"}
+
+# 端口被占时，错误会带回来，程序不退出
+# {"error":"listen tcp 127.0.0.1:8899: bind: address already in use"}
+
+# 停止，端口释放，控制接口仍在
+curl -s -X POST 127.0.0.1:8898/api/proxy/stop
 ```
 
-窗口模式下**不启动 API**：窗口已经在同一进程里，再加一层网络没有意义。
+窗口模式下窗口自己直接调核心（进程内函数调用），控制接口同时存在——给脚本和浏览器用，不影响窗口。
+
+### headless
+
+`-headless` 不开窗口，适合没有显示器的机器或 CI：
+
+```sh
+./qingqiuxia -headless                        # 只有控制接口 + 代理
+./qingqiuxia -headless -proxy 127.0.0.1:8899  # 顺带把代理也起来
+```
 
 没有显示器也能看界面，`ui.Render` 把它画成图片：
 
