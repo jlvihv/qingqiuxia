@@ -117,3 +117,57 @@ func TestInvalidateAppend(t *testing.T) {
 		}
 	}
 }
+
+// TestSearchFiltersLive checks that typing in the filter box narrows the list:
+// the text the user types has to reach the filter, which once it did not.
+func TestSearchFiltersLive(t *testing.T) {
+	s := qqx.NewStore(100)
+	app := qqx.NewApp(s)
+	for i, u := range []string{
+		"https://api.test/v1/users",
+		"https://api.test/v1/orders",
+		"https://cdn.test/app.js",
+	} {
+		s.Upsert(qqx.Session{ID: uint64(i + 1), Method: "GET", URL: u, Host: hostOfTest(u)})
+	}
+	if got := len(app.Visible()); got != 3 {
+		t.Fatalf("all rows = %d, want 3", got)
+	}
+
+	// What a keystroke does: the view copies the field into the filter.
+	app.Search = "order"
+	app.Filter.Text = app.Search
+	app.Invalidate()
+	rows := app.Visible()
+	if len(rows) != 1 {
+		t.Fatalf("filtered rows = %d, want 1", len(rows))
+	}
+	sess, ok := app.Store.At(rows[0])
+	if !ok || sess.Path() != "/v1/orders" {
+		t.Errorf("kept %+v", sess)
+	}
+
+	// Clearing the box brings them all back.
+	app.Search = ""
+	app.Filter.Text = ""
+	app.Invalidate()
+	if got := len(app.Visible()); got != 3 {
+		t.Errorf("after clearing = %d, want 3", got)
+	}
+}
+
+func hostOfTest(raw string) string {
+	s := raw
+	for i := 0; i+2 < len(s); i++ {
+		if s[i] == ':' && s[i+1] == '/' && s[i+2] == '/' {
+			s = s[i+3:]
+			break
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' {
+			return s[:i]
+		}
+	}
+	return s
+}

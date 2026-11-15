@@ -44,6 +44,13 @@ type App struct {
 	// down is why the core is unreachable, empty when it is.
 	down string
 
+	// OnToggleCapture, OnResume and OnAbort are what the toolbar and the
+	// breakpoint banner call. They are set by the command, so the view asks for
+	// an action instead of knowing how to reach the core.
+	OnToggleCapture func(on bool)
+	OnResume        func(pauseID uint64)
+	OnAbort         func(pauseID uint64)
+
 	// visible caches the indices the filter lets through, so that a frame
 	// does not re-filter a list of thousands twice.
 	visible      []int
@@ -98,6 +105,23 @@ func (a *App) SetCoreDown(err error) {
 	a.Recording = false
 }
 
+// SetCapturing records that capture was turned on or off.
+func (a *App) SetCapturing(on bool) {
+	a.Recording = on
+	a.down = ""
+}
+
+// SetPause records the message waiting at a breakpoint, which the banner shows.
+func (a *App) SetPause(p *Pause) {
+	a.Paused = &Paused{
+		ID: p.ID, SessionID: p.SessionID, Phase: p.Phase,
+		RuleName: p.RuleName, Method: p.Method, URL: p.URL,
+	}
+}
+
+// ClearPause removes the banner, when nothing is waiting any more.
+func (a *App) ClearPause() { a.Paused = nil }
+
 // Down reports why the core is unreachable, empty when it is reachable.
 func (a *App) Down() string { return a.down }
 
@@ -130,6 +154,16 @@ func (a *App) InvalidateAppend() {
 		copy(a.visible[1:], a.visible[:len(a.visible)-1])
 		a.visible[0] = 0
 	}
+}
+
+// isHostChosen reports whether the sidebar's host is the filter's choice.
+func (a *App) isHostChosen(host string) bool {
+	for _, h := range a.Filter.Hosts {
+		if h == host {
+			return true
+		}
+	}
+	return false
 }
 
 // hosts returns the sidebar's host list, recomputed only when the traffic or
@@ -181,6 +215,16 @@ func (a *App) View(c *ui.Context) {
 	t := Dark.Theme()
 	c.SetTheme(&t)
 
+	// The filter box writes into Search when a key is typed, which happens
+	// while this frame's input is handled; syncing here means the frame that
+	// draws the table already sees the new text, rather than one frame later.
+	// The comparison is against the filter the rows were built with, so a frame
+	// that changed nothing does not rebuild them and a keystroke does.
+	if a.Filter.Text != a.Search {
+		a.Filter.Text = a.Search
+		a.Invalidate()
+	}
+
 	p := &Dark
 	ui.Column(c).Fill().Background(p.Bg).Children(func() {
 		a.toolbar(c, p)
@@ -211,23 +255,35 @@ func (a *App) toolbar(c *ui.Context, p *Palette) {
 	})
 }
 
-// recordingDot says whether the core is capturing, in colour and in words.
+// recordingDot says whether the core is capturing, in colour and in words, and
+// turns capture on and off when clicked.
 func (a *App) recordingDot(c *ui.Context, p *Palette) {
 	colour := p.Danger
 	label := "录制中"
-	if a.down != "" {
+	action := "停止录制"
+	reachable := a.down == ""
+	if !reachable {
 		// A core that is not reachable must not keep a red light on: a stale
-		// "recording" tells the user the opposite of what is happening.
+		// "recording" tells the user the opposite of what is happening. The
+		// action names the state, not a toggle, since there is nothing to
+		// toggle: the button is a status light with nothing behind it.
 		colour = p.Dim
 		label = "核心未连接"
+		action = "核心未连接"
 	} else if !a.Recording {
 		colour = p.Dim
 		label = "已停止"
+		action = "开始录制"
 	}
-	ui.Row(c).Gap(6).Children(func() {
+	btn := ui.ButtonBase(c).Label(action)
+	btn.Gap(tokenSpace2).Padding(tokenSpace1, tokenSpace2).Radius(tokenRadiusControl)
+	btn.Children(func() {
 		ui.Row(c).Width(8).Height(8).Radius(4).Background(colour)
 		ui.Text(c, label).Bold().FontSize(tokenFontTitle).TextColor(p.Text)
 	})
+	if btn.Clicked() && reachable && a.OnToggleCapture != nil {
+		a.OnToggleCapture(!a.Recording)
+	}
 }
 
 // chip is a labelled value in the toolbar, as the proxy's address is.
@@ -249,8 +305,13 @@ func (a *App) pauseBanner(c *ui.Context, p *Palette) {
 			a.Paused.RuleName, a.Paused.Method, a.Paused.URL)).
 			FontSize(12).SingleLine().TextColor(p.Text)
 		ui.Row(c).Grow(1)
-		ui.Button(c, "中止")
-		ui.PrimaryButton(c, "放行")
+		pauseID := a.Paused.ID
+		if ui.Button(c, "中止").Clicked() && a.OnAbort != nil {
+			a.OnAbort(pauseID)
+		}
+		if ui.PrimaryButton(c, "放行").Clicked() && a.OnResume != nil {
+			a.OnResume(pauseID)
+		}
 	})
 }
 
@@ -267,10 +328,23 @@ func (a *App) mainArea(c *ui.Context, p *Palette) {
 func (a *App) sidebar(c *ui.Context, p *Palette) {
 	ui.Column(c).Fill().Background(p.Surface).PaddingY(tokenSpace3).Children(func() {
 		a.sidebarSection(c, p, "会话")
-		a.sidebarItem(c, p, "全部流量", a.Store.Len(), true)
+		a.sidebarItem(c, p, "全部流量", a.Store.Len(), len(a.Filter.Hosts) == 0, func() {
+			a.Filter.Hosts = nil
+			a.Invalidate()
+		})
 		a.sidebarSection(c, p, "域名")
 		for _, h := range a.hosts() {
-			a.sidebarItem(c, p, h.Host, h.Count, false)
+			host := h.Host
+			a.sidebarItem(c, p, host, h.Count, a.isHostChosen(host), func() {
+				// Choosing a host narrows the list to it; choosing it again
+				// clears the choice, so one row both filters and unfilters.
+				if a.isHostChosen(host) {
+					a.Filter.Hosts = nil
+				} else {
+					a.Filter.Hosts = []string{host}
+				}
+				a.Invalidate()
+			})
 		}
 	})
 }
@@ -281,17 +355,26 @@ func (a *App) sidebarSection(c *ui.Context, p *Palette, title string) {
 		TextColor(p.Dim).Padding(tokenSpace4, 10, tokenSpace1, 0)
 }
 
-// sidebarItem is one clickable row in the sidebar.
-func (a *App) sidebarItem(c *ui.Context, p *Palette, label string, count int, active bool) {
-	e := ui.Row(c).FillWidth().Height(tokenHeightRow).PaddingX(tokenSpace4).Gap(tokenSpace3)
+// sidebarItem is one clickable row in the sidebar. The label names it for a
+// screen reader and for a test; onPress runs when the row is chosen.
+func (a *App) sidebarItem(c *ui.Context, p *Palette, label string, count int, active bool, onPress func()) {
+	btn := ui.ButtonBase(c).Label(label)
+	e := btn.FillWidth().Height(tokenHeightRow).PaddingX(tokenSpace4).Gap(tokenSpace3)
 	if active {
 		e.Background(p.Hover)
 	}
 	e.Children(func() {
-		ui.Text(c, label).FontSize(tokenFontUI).SingleLine().TextColor(p.TextMuted)
+		colour := p.TextMuted
+		if active {
+			colour = p.Text
+		}
+		ui.Text(c, label).FontSize(tokenFontUI).SingleLine().TextColor(colour)
 		ui.Row(c).Grow(1)
 		ui.Text(c, fmt.Sprint(count)).FontSize(tokenFontSmall).Font(monoFamily).TextColor(p.Dim)
 	})
+	if btn.Clicked() && onPress != nil {
+		onPress()
+	}
 }
 
 // trafficList is the table of sessions, and the window's main subject.
@@ -306,7 +389,16 @@ func (a *App) trafficList(c *ui.Context, p *Palette) {
 func (a *App) filterBar(c *ui.Context, p *Palette) {
 	ui.Row(c).FillWidth().Height(tokenHeightBar).PaddingX(tokenSpace3).Gap(tokenSpace3).
 		Background(p.Surface).Children(func() {
-		ui.TextInput(c, &a.Search).Placeholder("过滤 URL、方法或状态码").Grow(1)
+		// The label names the box for a screen reader and for a test that
+		// clicks it; the placeholder is only a hint about what it accepts.
+		input := ui.TextInput(c, &a.Search).
+			Label("过滤").Placeholder("过滤 URL、方法或状态码").Grow(1)
+		if input.Changed() {
+			// The typed text narrows the list as it is typed; the table below
+			// is built after this, so it shows the new filter in this frame.
+			a.Filter.Text = a.Search
+			a.Invalidate()
+		}
 		ui.Text(c, fmt.Sprintf("%d 条", len(a.Visible()))).FontSize(tokenFontData).
 			Font(monoFamily).TextColor(p.Dim)
 	})

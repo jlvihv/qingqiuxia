@@ -86,6 +86,36 @@ func main() {
 		client := qqx.NewClient(*apiAddr, *token)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+
+		// The window asks for actions; the command is what knows how to reach
+		// the core. Each one runs off the main thread, so a slow request never
+		// stalls a frame.
+		app.OnToggleCapture = func(on bool) {
+			go func() {
+				if err := client.SetCapture(ctx, on); err == nil {
+					app.SetCapturing(on)
+					invalidate()
+				}
+			}()
+		}
+		app.OnResume = func(id uint64) {
+			go func() {
+				if err := client.Resume(ctx, id); err == nil {
+					app.ClearPause()
+					invalidate()
+				}
+			}()
+		}
+		app.OnAbort = func(id uint64) {
+			go func() {
+				if err := client.AbortPause(ctx, id); err == nil {
+					app.ClearPause()
+					invalidate()
+				}
+			}()
+		}
+		go followPauses(ctx, client, app, invalidate)
+
 		go client.Live(ctx, store, invalidate, func() {
 			mygo.RunOnMain(func() {
 				app.InvalidateAppend()
@@ -107,6 +137,42 @@ func main() {
 	})
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// followPauses keeps the breakpoint banner in step with the core: a pause shows
+// while one is waiting, and goes when it is released.
+func followPauses(ctx context.Context, c *qqx.Client, app *qqx.App, invalidate func()) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	last := uint64(0)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		pauses, err := c.Pauses(ctx)
+		if err != nil {
+			continue
+		}
+		if len(pauses) == 0 {
+			if last != 0 {
+				app.ClearPause()
+				last = 0
+				invalidate()
+			}
+			continue
+		}
+		p := pauses[0]
+		if p.ID != last {
+			app.SetPause(&qqx.Pause{
+				ID: p.ID, SessionID: p.SessionID, Phase: p.Phase,
+				RuleName: p.RuleName, Method: p.Method, URL: p.URL,
+			})
+			last = p.ID
+			invalidate()
+		}
 	}
 }
 
