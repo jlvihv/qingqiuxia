@@ -47,6 +47,12 @@ type testServer struct {
 
 func newServer(t *testing.T, opts api.Options) *testServer {
 	t.Helper()
+	return newServerWith(t, opts, nil)
+}
+
+// newServerWith builds a server and lets a test adjust the core it steers.
+func newServerWith(t *testing.T, opts api.Options, adjust func(*api.Core)) *testServer {
+	t.Helper()
 	ca, err := mitm.Generate("test CA")
 	if err != nil {
 		t.Fatal(err)
@@ -59,13 +65,17 @@ func newServer(t *testing.T, opts api.Options) *testServer {
 		Issuer: mitm.NewIssuer(ca),
 	})
 	ts := &testServer{pipeline: pol, rules: rules, pauses: pauses, sessions: sessions}
-	ts.Server = httptest.NewServer(api.New(api.Core{
+	core := api.Core{
 		Pipeline:  pol,
 		Version:   "test",
 		Started:   time.Now(),
 		Addr:      func() string { return "127.0.0.1:1234" },
-		CaptureOn: func() bool { return true },
-	}, opts))
+		CaptureOn: pol.Recording,
+	}
+	if adjust != nil {
+		adjust(&core)
+	}
+	ts.Server = httptest.NewServer(api.New(core, opts))
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -116,6 +126,35 @@ func TestStatus(t *testing.T) {
 	}
 	if st.Version != "test" || st.ProxyAddr != "127.0.0.1:1234" || st.APIVer != api.APIVersion {
 		t.Errorf("status = %+v", st)
+	}
+}
+
+// TestCaptureToggle checks that turning capture off is reported by the status
+// and stops recording, which a GUI shows as a switch.
+func TestCaptureToggle(t *testing.T) {
+	recording := true
+	ts := newServerWith(t, api.Options{}, func(c *api.Core) {
+		c.CaptureOn = func() bool { return recording }
+		c.SetCapture = func(on bool) { recording = on }
+	})
+
+	var st struct {
+		Capturing bool `json:"capturing"`
+	}
+	ts.do(t, "GET", "/api/status", nil, &st)
+	if !st.Capturing {
+		t.Error("capture should start on")
+	}
+	ts.do(t, "POST", "/api/capture", map[string]any{"enabled": false}, &st)
+	if st.Capturing {
+		t.Error("the response still says capturing")
+	}
+	if recording {
+		t.Error("the core was not told to stop")
+	}
+	ts.do(t, "GET", "/api/status", nil, &st)
+	if st.Capturing {
+		t.Error("the status still says capturing")
 	}
 }
 

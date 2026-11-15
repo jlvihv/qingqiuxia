@@ -38,13 +38,27 @@ func RemoveHopHeaders(h http.Header) {
 	}
 }
 
-// CopyHeader appends every value of src to dst, replacing what dst had.
+// CopyHeader replaces dst's contents with src's.
+//
+// The values are appended into dst's existing slices where they fit, so that a
+// response written per request does not allocate a header map and a slice per
+// header: the profiler showed this as a few percent of the core's garbage.
 func CopyHeader(dst, src http.Header) {
 	for k := range dst {
-		delete(dst, k)
+		if _, ok := src[k]; !ok {
+			delete(dst, k)
+		}
 	}
 	for k, vv := range src {
-		dst[k] = append([]string(nil), vv...)
+		existing, ok := dst[k]
+		if !ok {
+			// No entry to reuse: copy the values so that dst does not alias
+			// the message the caller still owns.
+			dst[k] = append(make([]string, 0, len(vv)), vv...)
+			continue
+		}
+		existing = existing[:0]
+		dst[k] = append(existing, vv...)
 	}
 }
 

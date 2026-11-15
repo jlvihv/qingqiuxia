@@ -359,6 +359,12 @@ func (s *Store) Begin(req *msg.Request, now time.Time) *Session {
 	evicted := s.pushLocked(sess)
 	s.mu.Unlock()
 
+	// Snapshots are deep copies, and a core with no GUI attached has nobody to
+	// publish to: skip the copying, which the profiler showed as most of the
+	// garbage under load.
+	if s.hub.Len() == 0 {
+		return sess
+	}
 	if evicted != nil {
 		s.hub.Publish(Event{Kind: EventDropped, Session: evicted.Snapshot()})
 	}
@@ -383,8 +389,13 @@ func (s *Store) pushLocked(sess *Session) *Session {
 	return evicted
 }
 
-// Publish republishes a session's current state after a change.
+// Publish republishes a session's current state after a change. It is a no-op
+// when nothing is listening, since the snapshots it would take are the deep
+// copies the profiler showed as the core's largest allocation.
 func (s *Store) Publish(sess *Session) {
+	if s.hub.Len() == 0 {
+		return
+	}
 	kind := EventUpdate
 	if p := sess.Snapshot().Phase; p != Pending {
 		kind = EventDone

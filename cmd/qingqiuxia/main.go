@@ -8,10 +8,13 @@ package main
 import (
 	"context"
 	"errors"
+	"expvar"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -48,6 +51,7 @@ type config struct {
 	sessionLimit int
 	interceptAll bool
 	verbose      bool
+	pprof        string
 }
 
 func run() error {
@@ -60,6 +64,7 @@ func run() error {
 	flag.IntVar(&cfg.sessionLimit, "sessions", 2000, "how many sessions to keep in memory")
 	flag.BoolVar(&cfg.interceptAll, "intercept", true, "decrypt TLS traffic")
 	flag.BoolVar(&cfg.verbose, "v", false, "log every exchange")
+	flag.StringVar(&cfg.pprof, "pprof", "", "if set, serve pprof and expvar on this address, for profiling the core")
 	flag.Parse()
 
 	if err := os.MkdirAll(cfg.dataDir, 0o700); err != nil {
@@ -102,7 +107,7 @@ func run() error {
 		Version:   version,
 		Started:   time.Now(),
 		Addr:      p.Addr,
-		CaptureOn: func() bool { return true },
+		CaptureOn: pol.Recording,
 		SetCapture: func(on bool) {
 			// Capture is the proxy's presence: turning it off stops recording
 			// new sessions while the proxy keeps forwarding.
@@ -122,9 +127,13 @@ func run() error {
 	log.Printf("ca      %s", filepath.Join(cfg.dataDir, "ca.crt"))
 	log.Printf("install the CA certificate in your client to see HTTPS traffic")
 
-	errs := make(chan error, 2)
+	errs := make(chan error, 3)
 	go func() { errs <- p.Serve() }()
 	go func() { errs <- server.Serve() }()
+	if cfg.pprof != "" {
+		go func() { errs <- serveProfiling(cfg.pprof) }()
+		log.Printf("pprof   http://%s/debug/pprof/", cfg.pprof)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -141,6 +150,23 @@ func run() error {
 	}
 	server.Close()
 	return p.Close()
+}
+
+// serveProfiling starts the standard library's profiling endpoints, which are
+// the way to find where the core spends its time under load.
+func serveProfiling(addr string) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.Handle("/debug/vars", expvar.Handler())
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 // repeater returns a function that re-sends a recorded request, for the API's

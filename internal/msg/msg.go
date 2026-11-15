@@ -15,6 +15,11 @@ import (
 type Message struct {
 	// Header holds the message headers, with the original key casing lost as
 	// in net/http. Hop-by-hop headers are not part of it.
+	//
+	// The proxy takes ownership of the header map net/http parsed rather than
+	// copying it: the copy showed up as the second largest allocation under
+	// load. A message handed to the session store is cloned there, so a
+	// snapshot never aliases a header the connection still owns.
 	Header http.Header
 
 	// Body holds the body bytes as they went on the wire, still encoded as

@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/jlvihv/qingqiuxia/internal/msg"
@@ -13,11 +14,14 @@ import (
 // It returns the request and, when the body ran past the limit, a reader for
 // the rest of it, which the proxy forwards untouched.
 func captureRequest(r *http.Request, limit int64) (*msg.Request, io.Reader, error) {
+	// The request's header map is taken over rather than copied: net/http is
+	// done with it once the handler runs, and a copy of every map was the
+	// second largest allocation under load.
 	req := &msg.Request{
 		Method:  r.Method,
 		URL:     cloneURL(r.URL),
 		Proto:   r.Proto,
-		Message: msg.Message{Header: r.Header.Clone()},
+		Message: msg.Message{Header: r.Header},
 	}
 	if r.Body == nil || r.Body == http.NoBody {
 		return req, nil, nil
@@ -53,7 +57,7 @@ func captureResponse(raw *http.Response, limit int64, start time.Time) (*msg.Res
 	resp := &msg.Response{
 		Status:  raw.StatusCode,
 		Proto:   raw.Proto,
-		Message: msg.Message{Header: raw.Header.Clone()},
+		Message: msg.Message{Header: raw.Header},
 	}
 	if raw.StatusCode == http.StatusNoContent || raw.StatusCode == http.StatusNotModified {
 		return resp, nil, nil
@@ -67,11 +71,16 @@ func captureResponse(raw *http.Response, limit int64, start time.Time) (*msg.Res
 		return resp, nil, nil
 	}
 
+	// The read buffer comes from a pool: a 32 KiB allocation per response was
+	// most of the core's garbage under load.
+	bp := bufferPool.Get().(*[]byte)
+	buf := *bp
+	defer bufferPool.Put(bp)
+
 	var (
 		body    []byte
 		total   int64
 		ttfb    time.Duration
-		buf     = make([]byte, 32<<10)
 		firstOK = false
 	)
 	for {
@@ -109,4 +118,14 @@ func cloneURL(u *url.URL) *url.URL {
 	}
 	c := *u
 	return &c
+}
+
+// bufferPool recycles the buffers the capture reads bodies through. A proxy
+// reads a body per response, so allocating one each time was the largest
+// source of garbage the profiler showed.
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32<<10)
+		return &b
+	},
 }
