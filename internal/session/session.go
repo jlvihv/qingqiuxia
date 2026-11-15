@@ -217,6 +217,11 @@ func (s *Session) SetTimings(t Timings) {
 }
 
 // SetResponse records the response the client will get.
+//
+// It is for the proxy while an exchange is in flight, not for changing a
+// recorded one: a snapshot a reader already holds does not change, and a
+// session that is done is history. A rule that changes future traffic does so
+// on the way through, not by editing what was captured.
 func (s *Session) SetResponse(resp *msg.Response) {
 	s.mu.Lock()
 	s.resp = resp
@@ -396,14 +401,6 @@ func (s *Store) Get(id uint64) (Snapshot, bool) {
 		return Snapshot{}, false
 	}
 	return sess.Snapshot(), true
-}
-
-// Session returns the live session, which only the proxy should use.
-func (s *Store) Session(id uint64) (*Session, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	sess, ok := s.byID[id]
-	return sess, ok
 }
 
 // List returns up to limit snapshots, oldest first, skipping the first offset.

@@ -10,7 +10,7 @@
 |---|---|
 | 抓流量 | HTTP/1.1 + HTTPS（自带 CA，按域名动态签证书），记录方法、URL、头、body、DNS/TCP/TLS/TTFB 时序 |
 | Mock | 匹配到的请求不发给源站，直接返回预设的状态码、头和 body |
-| 改写 | 请求侧和响应侧共 9 种动作：`set-url` `set-query` `set-header` `remove-header` `set-body` `replace-body` `set-status` `redirect` `delay` |
+| 改写 | 规则作用于**之后**的流量，改动在转发途中完成；请求侧和响应侧共 9 种动作：`set-url` `set-query` `set-header` `remove-header` `set-body` `replace-body` `set-status` `redirect` |
 | 断点 | 按规则暂停请求或响应，通过 API 看、改、放行或中止 |
 | 重放 | 把抓到的请求再发出去，支持次数、延迟、间隔；重放同样走规则和断点 |
 | 实时推送 | SSE 推流量变化和断点暂停事件 |
