@@ -35,6 +35,10 @@ type Core struct {
 	Addr func() string
 	// SetCapture turns capture on or off.
 	SetCapture func(bool)
+	// RulesChanged is called after a rule is added, changed or removed, so the
+	// core can write them down before the process ends: a rule someone spent
+	// five minutes writing should not go away because the window crashed.
+	RulesChanged func(specs []rule.Spec)
 	// CaptureOn reports whether capture is on.
 	CaptureOn func() bool
 	// Version is the core's version, for the status call.
@@ -87,43 +91,7 @@ func New(core Core, opts Options) *Server {
 
 // routes wires the API's paths.
 func (s *Server) routes() {
-	// Status and control.
-	s.mux.HandleFunc("GET /api/status", s.handleStatus)
-	s.mux.HandleFunc("POST /api/capture", s.handleCapture)
-
-	// Traffic.
-	s.mux.HandleFunc("GET /api/sessions", s.handleListSessions)
-	s.mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
-	s.mux.HandleFunc("DELETE /api/sessions", s.handleClearSessions)
-	s.mux.HandleFunc("GET /api/events", s.handleEvents)
-	s.mux.HandleFunc("POST /api/sessions/{id}/repeat", s.handleRepeat)
-
-	// Rules.
-	s.mux.HandleFunc("GET /api/rules", s.handleListRules)
-	s.mux.HandleFunc("PUT /api/rules", s.handleReplaceRules)
-	s.mux.HandleFunc("POST /api/rules", s.handleAddRule)
-	s.mux.HandleFunc("GET /api/rules/{id}", s.handleGetRule)
-	s.mux.HandleFunc("PATCH /api/rules/{id}", s.handlePatchRule)
-	s.mux.HandleFunc("DELETE /api/rules/{id}", s.handleDeleteRule)
-
-	// Breakpoints.
-	s.mux.HandleFunc("GET /api/breakpoints", s.handleListBreakpoints)
-	s.mux.HandleFunc("PUT /api/breakpoints", s.handleReplaceBreakpoints)
-	s.mux.HandleFunc("GET /api/pauses", s.handleListPauses)
-	s.mux.HandleFunc("POST /api/pauses/{id}/resume", s.handleResume)
-	s.mux.HandleFunc("POST /api/pauses/{id}/abort", s.handleAbortPause)
-	s.mux.HandleFunc("PUT /api/pauses/{id}", s.handleEditPause)
-
-	// Certificate.
-	s.mux.HandleFunc("GET /api/certificate", s.handleCertificate)
-
-	// The proxy's own listener, which is not this one.
-	s.proxyRoutes()
-
-	// What an agent reads first: how to use this API, in the shape that costs
-	// it the fewest tokens.
-	s.mux.HandleFunc("GET /api", s.handleIndex)
-	s.mux.HandleFunc("GET /api/help", s.handleIndex)
+	s.register()
 }
 
 // ServeHTTP applies the token check and then the routes.

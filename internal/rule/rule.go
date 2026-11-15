@@ -430,3 +430,17 @@ func sortRules(rules []*Rule) {
 		return rules[i].ID < rules[j].ID
 	})
 }
+
+// Specs turns a list of compiled rules back into the specs that describe them,
+// which is what a store keeps: a rule's compiled form is for matching, and a spec
+// is for writing down.
+func Specs(rules []*Rule) []Spec {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]Spec, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, r.Spec())
+	}
+	return out
+}

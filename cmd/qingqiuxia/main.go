@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"flag"
@@ -39,6 +40,7 @@ import (
 	"github.com/jlvihv/qingqiuxia/internal/proxy"
 	"github.com/jlvihv/qingqiuxia/internal/rule"
 	"github.com/jlvihv/qingqiuxia/internal/session"
+	pstore "github.com/jlvihv/qingqiuxia/internal/store"
 	qqx "github.com/jlvihv/qingqiuxia/internal/ui"
 )
 
@@ -109,6 +111,9 @@ type config struct {
 	verbose      bool
 	pprofAddr    string
 	headless     bool
+	// keepSessions and keepDays bound what the database keeps.
+	keepSessions int
+	keepDays     int
 }
 
 func parseFlags() config {
@@ -123,6 +128,8 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.verbose, "v", false, "log every exchange")
 	flag.StringVar(&cfg.pprofAddr, "pprof", "", "if set, serve pprof and expvar on this address")
 	flag.BoolVar(&cfg.headless, "headless", false, "run the core without a window")
+	flag.IntVar(&cfg.keepSessions, "keep-sessions", 2000, "数据库里最多留多少条历史流量")
+	flag.IntVar(&cfg.keepDays, "keep-days", 7, "历史流量最多留几天")
 	flag.Parse()
 	return cfg
 }
@@ -158,6 +165,8 @@ type core struct {
 	proxy    *proxy.Proxy
 	server   *api.Server
 	pipeline *pipeline.Pipeline
+	rules    *rule.Engine
+	store    *pstore.DB
 	cfg      config
 }
 
@@ -167,8 +176,15 @@ func buildCore(cfg config) (*core, error) {
 	if err != nil {
 		return nil, err
 	}
+	db, err := pstore.Open(context.Background(), filepath.Join(cfg.dataDir, "qingqiuxia.db"))
+	if err != nil {
+		return nil, err
+	}
+
 	rules := rule.NewEngine()
-	if err := loadRules(cfg.dataDir, rules); err != nil {
+	// 规则从数据库读：那是人写的东西，丢了要重写。
+	if err := loadRules(context.Background(), db, rules); err != nil {
+		db.Close()
 		return nil, err
 	}
 	sessions := session.NewStore(cfg.sessionLimit)
@@ -192,6 +208,7 @@ func buildCore(cfg config) (*core, error) {
 	// because a number it chose for them was busy.
 	if cfg.proxyAddr != "" {
 		if _, err := pr.Start(cfg.proxyAddr); err != nil {
+			db.Close()
 			return nil, fmt.Errorf("start the proxy on %s: %w", cfg.proxyAddr, err)
 		}
 	}
@@ -205,6 +222,14 @@ func buildCore(cfg config) (*core, error) {
 		SetCapture: pol.SetRecording,
 		Repeat:     repeater(pr),
 		Resources:  api.ProcessResources,
+		RulesChanged: func(specs []rule.Spec) {
+			// 规则一改就落盘：写规则的人不想因为窗口崩了就重写一遍。
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := db.SaveRules(ctx, specs); err != nil {
+				log.Printf("保存规则失败: %v", err)
+			}
+		},
 		Proxy: &proxyControl{
 			start:  pr.Start,
 			stop:   pr.Stop,
@@ -222,7 +247,10 @@ func buildCore(cfg config) (*core, error) {
 		pr.Close()
 		return nil, fmt.Errorf("control API on %s: %w", cfg.apiAddr, err)
 	}
-	return &core{proxy: pr, server: server, pipeline: pol, cfg: cfg}, nil
+	return &core{
+		proxy: pr, server: server, pipeline: pol,
+		rules: rules, store: db, cfg: cfg,
+	}, nil
 }
 
 // log says where the proxy is and what to install.
@@ -292,6 +320,10 @@ func (c *core) serveWithWindow() error {
 	app := qqx.NewApp(store)
 	app.Selected = 0
 	app.SetBackend(local, local)
+
+	// 上次的窗口形状和近期流量，在开窗之前恢复：窗口一出来就该是上次的样子，
+	// 而不是先闪一下默认布局再跳。
+	saved := c.restoreSession(store, app)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -372,10 +404,14 @@ func (c *core) serveWithWindow() error {
 	go follow(ctx, local, store, app, invalidate)
 
 	mygo.App.WhenReady(func() {
+		w, h := float32(1440), float32(900)
+		if saved.Width > 400 && saved.Height > 300 {
+			w, h = saved.Width, saved.Height
+		}
 		win = mygo.NewWindow(mygo.WindowOptions{
 			Title:   "请求侠",
-			Width:   1440,
-			Height:  900,
+			Width:   int(w),
+			Height:  int(h),
 			Content: ui.View(app.View),
 		})
 	})
@@ -457,6 +493,40 @@ func follow(ctx context.Context, local *qqx.Local, store *qqx.Store, app *qqx.Ap
 func (c *core) close() {
 	c.server.Close()
 	c.proxy.Close()
+	if c.store != nil {
+		if err := c.saveState(); err != nil {
+			log.Printf("保存状态失败: %v", err)
+		}
+		c.store.Close()
+	}
+}
+
+// saveState writes what should outlive this run: the rules, and the traffic
+// still worth reading.
+func (c *core) saveState() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if specs := rule.Specs(c.rules.Rules()); len(specs) > 0 || c.store != nil {
+		if err := c.store.SaveRules(ctx, specs); err != nil {
+			return fmt.Errorf("保存规则: %w", err)
+		}
+	}
+
+	// The traffic: the sessions the core still holds, which is what a user
+	// would have seen on screen.
+	list := c.pipeline.Sessions().List(0, -1)
+	records := make([]pstore.Record, 0, len(list))
+	for _, snap := range list {
+		records = append(records, recordOfSnapshot(snap))
+	}
+	if err := c.store.SaveSessions(ctx, records); err != nil {
+		return fmt.Errorf("保存流量: %w", err)
+	}
+	if err := c.store.Prune(ctx, c.cfg.keepSessions, time.Duration(c.cfg.keepDays)*24*time.Hour); err != nil {
+		return fmt.Errorf("清理旧流量: %w", err)
+	}
+	return nil
 }
 
 // repeater re-sends a recorded request, for the API's replay call.
@@ -508,24 +578,65 @@ func defaultDataDir() string {
 }
 
 // loadRules reads the saved rules, if there are any.
-func loadRules(dir string, e *rule.Engine) error {
-	path := filepath.Join(dir, "rules.json")
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+func loadRules(ctx context.Context, db *pstore.DB, e *rule.Engine) error {
+	specs, err := db.LoadRules(ctx)
+	if err != nil {
+		return fmt.Errorf("读规则: %w", err)
+	}
+	if len(specs) == 0 {
+		// 早期版本把规则存在 rules.json 里，第一次启动新版本时搬过来。
+		specs = migrateRulesFile(filepath.Join(defaultDataDir(), "rules.json"))
+	}
+	if len(specs) == 0 {
 		return nil
 	}
+	if err := e.Replace(specs); err != nil {
+		return fmt.Errorf("恢复规则: %w", err)
+	}
+	log.Printf("恢复了 %d 条规则", len(specs))
+	return nil
+}
+
+// migrateRulesFile reads the old rules.json, once.
+func migrateRulesFile(path string) []rule.Spec {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil
 	}
 	specs, err := rule.ParseSpecs(data)
 	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+		return nil
 	}
-	if err := e.Replace(specs); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+	log.Printf("从 %s 搬来 %d 条规则", path, len(specs))
+	return specs
+}
+
+// recordOfSnapshot turns a session into what the store keeps.
+func recordOfSnapshot(s session.Snapshot) pstore.Record {
+	r := pstore.Record{
+		ID:       s.ID,
+		Started:  s.Timings.Start,
+		Phase:    s.Phase.String(),
+		Source:   s.Source.String(),
+		Duration: s.Timings.Duration().Seconds() * 1000,
+		Bytes:    s.BytesOut,
 	}
-	log.Printf("loaded %d rules from %s", len(specs), path)
-	return nil
+	if s.Request != nil {
+		r.Method = s.Request.Method
+		if s.Request.URL != nil {
+			r.URL = s.Request.URL.String()
+			r.Host = s.Request.URL.Host
+		}
+	}
+	if s.Response != nil {
+		r.Status = s.Response.Status
+	}
+	if len(s.Notes) > 0 {
+		if data, err := json.Marshal(s.Notes); err == nil {
+			r.Notes = string(data)
+		}
+	}
+	return r
 }
 
 // proxyControl adapts the proxy to the control API's ProxyController, which is
@@ -542,3 +653,76 @@ func (p *proxyControl) StartProxy(addr string) (string, error) {
 	return p.start(addr)
 }
 func (p *proxyControl) StopProxy() error { return p.stop() }
+
+// restoreSession brings back what the last run left: the window's shape, and the
+// traffic it was showing.
+//
+// 流量只恢复最近的几百条，不恢复全部：那是接着上次继续看用的痕迹，不是归档。
+// 太多会让启动变慢，也让用户以为这次也抓到了这么多。
+func (c *core) restoreSession(store *qqx.Store, app *qqx.App) pstore.Window {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	w, ok, err := c.store.LoadWindow(ctx)
+	if err != nil {
+		log.Printf("读窗口状态失败: %v", err)
+	} else if ok {
+		if w.SidebarWidth > 60 {
+			app.SidebarWidth = w.SidebarWidth
+		}
+		if w.MainWidth > 120 {
+			app.MainWidth = w.MainWidth
+		}
+		app.Detail = w.Detail
+		app.Search = w.Search
+		app.Filter.Text = w.Search
+	}
+
+	records, err := c.store.LoadSessions(ctx, c.cfg.sessionLimit)
+	if err != nil {
+		log.Printf("读历史流量失败: %v", err)
+		return w
+	}
+	// 存储里是最新在前，而 store 是往前插，所以反过来喂。
+	for i := len(records) - 1; i >= 0; i-- {
+		r := records[i]
+		store.Upsert(qqx.Session{
+			ID: r.ID, Phase: r.Phase, Source: r.Source, Method: r.Method,
+			URL: r.URL, Host: r.Host, Status: r.Status,
+			DurationMS: r.Duration, BytesOut: r.Bytes, Started: r.Started,
+			Notes: notesOf(r.Notes),
+		})
+	}
+	if n := store.Len(); n > 0 {
+		log.Printf("恢复了 %d 条历史流量", n)
+	}
+	app.Invalidate()
+	return w
+}
+
+// rememberWindow stores the window's shape for the next run.
+func (c *core) rememberWindow(app *qqx.App) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	w := pstore.Window{
+		SidebarWidth: app.SidebarWidth,
+		MainWidth:    app.MainWidth,
+		Detail:       app.Detail,
+		Search:       app.Search,
+	}
+	if err := c.store.SaveWindow(ctx, w); err != nil {
+		log.Printf("保存窗口状态失败: %v", err)
+	}
+}
+
+// notesOf reads the notes a record kept.
+func notesOf(text string) []qqx.Note {
+	if text == "" {
+		return nil
+	}
+	var notes []qqx.Note
+	if err := json.Unmarshal([]byte(text), &notes); err != nil {
+		return nil
+	}
+	return notes
+}

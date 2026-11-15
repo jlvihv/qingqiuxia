@@ -55,7 +55,17 @@ func (s *Server) handleReplaceRules(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.rulesChanged(e)
 	s.handleListRules(w, r)
+}
+
+// rulesChanged tells the core to write the rules down now, so that a crash does
+// not cost someone the rules they just wrote.
+func (s *Server) rulesChanged(e *rule.Engine) {
+	if s.core.RulesChanged == nil {
+		return
+	}
+	s.core.RulesChanged(rule.Specs(e.Rules()))
 }
 
 // handleGetRule returns one rule, which a caller reads before changing it.
@@ -92,6 +102,7 @@ func (s *Server) handleAddRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.rulesChanged(e)
 	writeJSON(w, http.StatusCreated, toRuleView(added))
 }
 
@@ -120,6 +131,7 @@ func (s *Server) handlePatchRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	s.rulesChanged(e)
 	writeJSON(w, http.StatusOK, toRuleView(updated))
 }
 
@@ -136,6 +148,7 @@ func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	s.rulesChanged(e)
 	w.WriteHeader(http.StatusNoContent)
 }
 
