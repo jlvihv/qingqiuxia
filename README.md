@@ -36,18 +36,16 @@ curl -O http://127.0.0.1:8898/api/certificate?download=1
 然后看抓到了什么：
 
 ```sh
-# 窗口模式下走 socket，-headless 模式下走 TCP
-curl -s --unix-socket ~/.config/qingqiuxia/core.sock http://unix/api/sessions | jq '.sessions[0]'
-curl -s 127.0.0.1:8898/api/sessions | jq '.sessions[0]'   # -headless
+# API 只在 -headless 时存在：窗口模式是进程内直接调用，没有端口
+curl -s 127.0.0.1:8898/api/sessions | jq '.sessions[0]'
 ```
 
 ## 命令行
 
 ```
--proxy    代理监听地址（默认 127.0.0.1:8899）
--headless 只跑核心，不开窗口
+-proxy    代理地址；空表示启动时不监听，由窗口里选端口
+-headless 只跑核心，不开窗口，同时启用 HTTP API
 -api      -headless 时的 API 地址（默认 127.0.0.1:8898）
--socket   窗口模式下 API 的 unix socket 路径（默认 <数据目录>/core.sock）
 -data     CA 和规则文件所在目录（默认 ~/.config/qingqiuxia）
 -token    API 令牌，默认空（只在回环地址或 socket 上安全）
 -max-body 每个 body 保留多少字节用于查看和改写（默认 4 MiB）
@@ -151,23 +149,54 @@ go test ./internal/proxy -bench . -run XXX   # 基准
 - body 超过 `-max-body` 的部分不保留：会照常转发给源站，但会话里只有开头一段，并标记 `truncated`。
 - WebSocket 目前走透传，不解帧。
 
-## 一个进程，两个部分
+## 一个进程，直接调用
 
-`qingqiuxia` 是核心，也是窗口。它们的边界没有因此消失：**窗口通过 HTTP API 访问核心**，和任何其他客户端一样，只是走一条 unix socket，而不是 TCP 端口。
+`qingqiuxia` 是核心，也是窗口，跑在一个进程里。窗口调用核心是 **Go 函数调用**，不经过网络：一条会话从代理记录下来到出现在表格里，中间没有 JSON 编码解码，也没有 socket。
 
-这样做的取舍：
+边界靠接口表达，不靠传输层：
 
-- 保留了边界 —— 视图不知道代理的存在，换成网页前端也不用动核心
-- 去掉了拆分的代价 —— 不用挑端口、不用守 token、不会出现窗口活着而核心已死
-- socket 只有本进程能连，也不占端口
+```go
+// Backend 是窗口对核心的全部需求：六个操作。
+// 桌面窗口用进程内实现调用它；脚本或浏览器用 HTTP 实现调用同一个接口。
+type Backend interface {
+	Status(ctx) (Status, error)
+	Sessions(ctx, limit) ([]Session, int, uint64, error)
+	SetCapture(ctx, on bool) error
+	Pauses(ctx) ([]Pause, error)
+	Resume(ctx, pauseID uint64, abort bool) error
+	Watch(ctx, fn func(Change)) error
+}
+```
 
-`-headless` 只跑核心，给没有显示器的机器或 CI 用，那时 API 退回 TCP。
+窗口不认识代理，只认识这六个方法。换网页前端时，实现同一个 `Backend` 即可。
+
+### 端口：不预设，随时改
+
+**启动时不监听任何端口**。窗口工具栏里有个端口输入框，填了才启动：
+
+```
+代理 [8899      ] [启动]
+```
+
+- 留空 = 让系统分配一个空闲端口
+- 只填数字 = `127.0.0.1:<端口>`
+- 填 `host:port` = 监听该地址
+- 端口被占用时，错误显示在输入框旁边，不吞掉
+- 运行中显示实际地址和 `[停止]`；停止后输入框保留上次的地址，改个数字再启动即可
+
+命令行也可以直接给地址：`./qingqiuxia -proxy 127.0.0.1:8899`。
+
+### headless
+
+`-headless` 只跑核心，不开窗口，这时才启用 HTTP API（TCP），给没有显示器的机器或 CI 用：
 
 ```sh
-./qingqiuxia                          # 窗口模式，API 在 <数据目录>/core.sock
-./qingqiuxia -headless                # 只跑核心，API 在 127.0.0.1:8898
-./qingqiuxia -data /tmp/d -proxy :9999  # 换数据目录和代理端口
+./qingqiuxia -headless                        # 核心 + API 127.0.0.1:8898
+./qingqiuxia -headless -proxy 127.0.0.1:8899  # 顺带把代理也起来
+curl -s 127.0.0.1:8898/api/sessions | jq .
 ```
+
+窗口模式下**不启动 API**：窗口已经在同一进程里，再加一层网络没有意义。
 
 没有显示器也能看界面，`ui.Render` 把它画成图片：
 

@@ -37,10 +37,9 @@ func BenchmarkPlainHTTP(b *testing.B) {
 	defer origin.Close()
 
 	p := New(noopPolicy{}, Tuning{})
-	if err := p.Listen("127.0.0.1:0"); err != nil {
+	if _, err := p.Start("127.0.0.1:0"); err != nil {
 		b.Fatal(err)
 	}
-	go p.Serve()
 	defer p.Close()
 
 	pu, _ := url.Parse("http://" + p.Addr())
@@ -69,10 +68,9 @@ func BenchmarkCaptureLargeBody(b *testing.B) {
 	defer origin.Close()
 
 	p := New(noopPolicy{}, Tuning{MaxBodyBytes: 1 << 20})
-	if err := p.Listen("127.0.0.1:0"); err != nil {
+	if _, err := p.Start("127.0.0.1:0"); err != nil {
 		b.Fatal(err)
 	}
-	go p.Serve()
 	defer p.Close()
 
 	pu, _ := url.Parse("http://" + p.Addr())

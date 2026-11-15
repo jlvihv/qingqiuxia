@@ -57,13 +57,13 @@ func startStack(t *testing.T, opts ...func(*stack)) *stack {
 		},
 	})
 	pr := proxy.New(s.pipeline, proxy.Tuning{})
-	if err := pr.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("listen: %v", err)
+	addr, err := pr.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("start: %v", err)
 	}
-	go pr.Serve()
-	t.Cleanup(func() { pr.Close() })
+	t.Cleanup(func() { pr.Stop() })
 	s.proxy = pr
-	s.addr = pr.Addr()
+	s.addr = addr
 	return s
 }
 

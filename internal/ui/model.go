@@ -296,3 +296,27 @@ func (s *Store) Hosts() []HostCount {
 	}
 	return out
 }
+
+// Status is what the core says about itself.
+type Status struct {
+	Version   string
+	ProxyAddr string
+	Capturing bool
+	Sessions  int
+	Rules     int
+	Paused    int
+	MemoryMB  uint64
+	// Goroutines is the core's goroutine count, which the status bar shows
+	// where an earlier version showed threads.
+	Goroutines int
+}
+
+// Pause is a message held at a breakpoint.
+type Pause struct {
+	ID        uint64
+	SessionID uint64
+	Phase     string
+	RuleName  string
+	Method    string
+	URL       string
+}

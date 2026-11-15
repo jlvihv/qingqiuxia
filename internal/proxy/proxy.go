@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,12 +86,18 @@ type Proxy struct {
 	// dialer is the origin dialer; it is replaceable in tests.
 	dialer *net.Dialer
 
-	started    atomic.Bool
-	closed     atomic.Bool
-	logger     *log.Logger
+	started atomic.Bool
+	logger  *log.Logger
+
+	// mu guards the fields a Start or a Stop changes, so that the proxy can be
+	// moved to another port, or stopped and started again, while the process
+	// runs.
 	mu         sync.Mutex
 	active     map[net.Conn]struct{}
 	transports map[string]*http.Transport
+	// stopDone is closed when the running server has finished, so a Stop can
+	// wait for every connection to be done rather than cut them.
+	stopDone chan struct{}
 }
 
 // New returns a proxy that asks p about every exchange. Call Serve or Listen to
@@ -173,21 +180,114 @@ func (ex *Exchange) setTimings(t Timings) {
 	ex.mu.Unlock()
 }
 
-// Listen starts the proxy on addr, which may be ":0" for any free port.
-func (p *Proxy) Listen(addr string) error {
+// Start listens on addr and begins serving in the background. It may be called
+// again on a stopped proxy to move it to another port, which is what a user
+// changing the port while the proxy is off expects.
+//
+// addr may be ":0", or a bare port, for any free one.
+func (p *Proxy) Start(addr string) (string, error) {
+	p.mu.Lock()
+	if p.stopDone != nil {
+		p.mu.Unlock()
+		return "", fmt.Errorf("proxy: already running on %s", p.addr)
+	}
+	if addr != "" && !strings.Contains(addr, ":") {
+		// "8899" is a port, which every user means by it.
+		addr = "127.0.0.1:" + addr
+	}
+	if addr == "" {
+		addr = "127.0.0.1:0"
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		p.mu.Unlock()
+		return "", err
 	}
 	p.ln = ln
 	p.addr = ln.Addr().String()
+	srv := &http.Server{
+		Handler:           p,
+		ReadHeaderTimeout: p.tune.HandshakeTime,
+		IdleTimeout:       p.tune.IdleTimeout,
+		ErrorLog:          log.New(io.Discard, "", 0),
+	}
+	p.srv = srv
+	done := make(chan struct{})
+	p.stopDone = done
 	p.started.Store(true)
-	return nil
+	// Listeners and connections are per run, so a stopped proxy starts clean.
+	p.active = make(map[net.Conn]struct{})
+	p.transports = make(map[string]*http.Transport, 2)
+	p.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		if err := srv.Serve(&trackingListener{Listener: ln, p: p}); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
+			p.logf("proxy stopped: %v", err)
+		}
+	}()
+	return p.addr, nil
+}
+
+// Stop stops serving and closes every connection. The proxy can be started
+// again afterwards, on the same port or another.
+func (p *Proxy) Stop() error {
+	p.mu.Lock()
+	done, srv, addr := p.stopDone, p.srv, p.addr
+	if done == nil {
+		p.mu.Unlock()
+		return nil
+	}
+	p.stopDone = nil
+	p.srv = nil
+	p.ln = nil
+	p.addr = ""
+	p.started.Store(false)
+	// Connections are cut rather than waited for: a proxy holding a client's
+	// keep-alive open would otherwise keep the port for as long as the client
+	// cares, and stopping is a decision the user already made.
+	for c := range p.active {
+		c.Close()
+	}
+	p.active = make(map[net.Conn]struct{})
+	for _, t := range p.transports {
+		t.CloseIdleConnections()
+	}
+	p.mu.Unlock()
+
+	var err error
+	if srv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		err = srv.Shutdown(ctx)
+	}
+	// The serve goroutine closes done once Serve returns.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+	p.logf("proxy stopped on %s", addr)
+	return err
+}
+
+// Addr returns the address the proxy listens on, empty while stopped.
+func (p *Proxy) Addr() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.addr
+}
+
+// SetLogger makes the proxy report connection failures to l, for a caller that
+// wants to see them; a nil logger is silent.
+func (p *Proxy) SetLogger(l *log.Logger) {
+	p.mu.Lock()
+	p.logger = l
+	p.mu.Unlock()
 }
 
 // Replay sends a recorded request again. It goes through the policy like any
-// other exchange, so a replay is captured, runs the rules and can be paused:
-// that is what makes "send it again with one header changed" useful.
+// other exchange, so a replay is captured, runs the rules and can be paused.
 //
 // The response is discarded; the session holds it.
 func (p *Proxy) Replay(ctx context.Context, req *msg.Request) error {
@@ -200,6 +300,16 @@ func (p *Proxy) Replay(ctx context.Context, req *msg.Request) error {
 	if err != nil {
 		p.policy.Complete(ex, nil, err)
 		return err
+	}
+	if decision.Delay > 0 {
+		t := time.NewTimer(decision.Delay)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			p.policy.Complete(ex, nil, ctx.Err())
+			return ctx.Err()
+		}
 	}
 	if decision.Abort || decision.Mock != nil {
 		resp := decision.Mock
@@ -224,90 +334,12 @@ func (p *Proxy) Replay(ctx context.Context, req *msg.Request) error {
 	return nil
 }
 
-// SetLogger makes the proxy report connection failures to l, for a caller that
-// wants to see them; a nil logger is silent.
-func (p *Proxy) SetLogger(l *log.Logger) { p.logger = l }
+// Running reports whether the proxy is serving.
+func (p *Proxy) Running() bool { return p.started.Load() }
 
-// Addr returns the address the proxy listens on.
-func (p *Proxy) Addr() string { return p.addr }
-
-// Serve accepts connections until Close. Listen must have been called, or addr
-// is empty and the proxy listens on 127.0.0.1:8899.
-func (p *Proxy) Serve() error {
-	if p.ln == nil {
-		if err := p.Listen("127.0.0.1:8899"); err != nil {
-			return err
-		}
-	}
-	srv := &http.Server{
-		Handler:           p,
-		ReadHeaderTimeout: p.tune.HandshakeTime,
-		IdleTimeout:       p.tune.IdleTimeout,
-		ErrorLog:          log.New(io.Discard, "", 0),
-		// A debugging proxy must not try to be clever about errors the client
-		// should see.
-		DisableGeneralOptionsHandler: false,
-	}
-	p.srv = srv
-	err := srv.Serve(&trackingListener{Listener: p.ln, p: p})
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-	return err
-}
-
-// trackingListener remembers accepted connections so that Close can close them
-// and Serve can wait.
-type trackingListener struct {
-	net.Listener
-	p *Proxy
-}
-
-func (l *trackingListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	l.p.mu.Lock()
-	l.p.active[c] = struct{}{}
-	l.p.mu.Unlock()
-	return &trackedConn{Conn: c, p: l.p}, nil
-}
-
-// trackedConn removes itself from the proxy's set when it closes.
-type trackedConn struct {
-	net.Conn
-	p    *Proxy
-	once sync.Once
-}
-
-func (c *trackedConn) Close() error {
-	err := c.Conn.Close()
-	c.once.Do(func() {
-		c.p.mu.Lock()
-		delete(c.p.active, c.Conn)
-		c.p.mu.Unlock()
-	})
-	return err
-}
-
-// Close stops the proxy, closing its listener and every connection it serves.
+// Close stops the proxy for good.
 func (p *Proxy) Close() error {
-	if !p.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	var err error
-	if p.srv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		err = p.srv.Shutdown(ctx)
-	}
-	p.mu.Lock()
-	for c := range p.active {
-		c.Close()
-	}
-	p.mu.Unlock()
-	return err
+	return p.Stop()
 }
 
 // ServeHTTP handles every connection the proxy accepts: a plain HTTP request,
@@ -808,5 +840,49 @@ func unwrapURLError(err error) error {
 	if errors.As(err, &ue) {
 		return ue.Err
 	}
+	return err
+}
+
+// trackingListener remembers accepted connections, so that stopping the proxy
+// can close them: a client's keep-alive would otherwise hold the port open, and
+// stopping is a decision the user already made.
+type trackingListener struct {
+	net.Listener
+	p *Proxy
+}
+
+func (l *trackingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	p := l.p
+	p.mu.Lock()
+	// The proxy may have been stopped between the accept and here.
+	if p.active == nil {
+		p.mu.Unlock()
+		c.Close()
+		return nil, net.ErrClosed
+	}
+	p.active[c] = struct{}{}
+	p.mu.Unlock()
+	return &trackedConn{Conn: c, p: p}, nil
+}
+
+// trackedConn removes itself from the proxy's set when it closes.
+type trackedConn struct {
+	net.Conn
+	p    *Proxy
+	once sync.Once
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		p := c.p
+		p.mu.Lock()
+		delete(p.active, c.Conn)
+		p.mu.Unlock()
+	})
 	return err
 }

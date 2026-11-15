@@ -51,6 +51,23 @@ type App struct {
 	OnResume        func(pauseID uint64)
 	OnAbort         func(pauseID uint64)
 
+	// ProxyRunning says whether the proxy is listening, and PortAddr where.
+	// PortText is what the user typed in the port field.
+	ProxyRunning bool
+	PortAddr     string
+	PortText     string
+	// PortError is why the last start failed, empty when it did not.
+	PortError string
+	// OnStartProxy and OnStopProxy act on the proxy's port. The address comes
+	// from PortText, so it may be a port, an address, or empty for any free
+	// one.
+	OnStartProxy func(addr string)
+	OnStopProxy  func()
+
+	// backend and control are the core, as the command passed it.
+	backend Backend
+	control Control
+
 	// visible caches the indices the filter lets through, so that a frame
 	// does not re-filter a list of thousands twice.
 	visible      []int
@@ -241,7 +258,7 @@ func (a *App) toolbar(c *ui.Context, p *Palette) {
 	ui.Row(c).FillWidth().Height(tokenHeightToolbar).PaddingX(tokenSpace4).Gap(tokenSpace3).
 		Background(p.Surface).Children(func() {
 		a.recordingDot(c, p)
-		a.chip(c, p, "代理", a.ProxyAddr)
+		a.portControl(c, p)
 		ca := "未安装"
 		if a.CAInstalled {
 			ca = "已安装"
@@ -257,22 +274,32 @@ func (a *App) toolbar(c *ui.Context, p *Palette) {
 
 // recordingDot says whether the core is capturing, in colour and in words, and
 // turns capture on and off when clicked.
+// recordingDot says what the core is doing, in colour and in words, and turns
+// capture on and off when clicked.
+//
+// The states are three, not two: a proxy that is not listening cannot be
+// recording, so a red light there would say the opposite of what is happening.
+// Nothing toggles when the proxy is off: there is no traffic to record.
 func (a *App) recordingDot(c *ui.Context, p *Palette) {
 	colour := p.Danger
 	label := "录制中"
 	action := "停止录制"
 	reachable := a.down == ""
-	if !reachable {
-		// A core that is not reachable must not keep a red light on: a stale
-		// "recording" tells the user the opposite of what is happening. The
-		// action names the state, not a toggle, since there is nothing to
-		// toggle: the button is a status light with nothing behind it.
+	switch {
+	case !reachable:
+		// A core that is not reachable must not keep a red light on. The
+		// action names the state rather than a toggle, since there is nothing
+		// to toggle.
 		colour = p.Dim
 		label = "核心未连接"
 		action = "核心未连接"
-	} else if !a.Recording {
+	case !a.ProxyRunning:
 		colour = p.Dim
-		label = "已停止"
+		label = "代理未启动"
+		action = "代理未启动"
+	case !a.Recording:
+		colour = p.Warning
+		label = "未录制"
 		action = "开始录制"
 	}
 	btn := ui.ButtonBase(c).Label(action)
@@ -281,9 +308,43 @@ func (a *App) recordingDot(c *ui.Context, p *Palette) {
 		ui.Row(c).Width(8).Height(8).Radius(4).Background(colour)
 		ui.Text(c, label).Bold().FontSize(tokenFontTitle).TextColor(p.Text)
 	})
-	if btn.Clicked() && reachable && a.OnToggleCapture != nil {
+	if btn.Clicked() && reachable && a.ProxyRunning && a.OnToggleCapture != nil {
 		a.OnToggleCapture(!a.Recording)
 	}
+}
+
+// portControl is the proxy's address and its switch.
+//
+// The proxy is not necessarily running: a window that is only looking at traffic
+// from another source, or one just opened, has nothing listening yet, and the
+// user chooses the port rather than being given one that might be taken. The
+// field is editable while stopped and shows the address while running.
+func (a *App) portControl(c *ui.Context, p *Palette) {
+	ui.Row(c).Height(26).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusControl).
+		Background(p.Raised).Children(func() {
+		if a.ProxyRunning {
+			ui.Text(c, "代理").FontSize(tokenFontBody).TextColor(p.TextMuted)
+			ui.Text(c, a.PortAddr).FontSize(tokenFontBody).Font(monoFamily).
+				TextColor(p.Success).SingleLine()
+			if ui.Button(c, "停止").Clicked() && a.OnStopProxy != nil {
+				a.OnStopProxy()
+			}
+			return
+		}
+		ui.Text(c, "代理").FontSize(tokenFontBody).TextColor(p.TextMuted)
+		input := ui.TextInput(c, &a.PortText).
+			Label("代理端口").Placeholder("端口或地址，留空随机").Width(150)
+		if input.Submitted() && a.OnStartProxy != nil {
+			a.OnStartProxy(a.PortText)
+		}
+		if ui.PrimaryButton(c, "启动").Clicked() && a.OnStartProxy != nil {
+			a.OnStartProxy(a.PortText)
+		}
+		if a.PortError != "" {
+			ui.Text(c, a.PortError).FontSize(tokenFontSmall).
+				TextColor(p.Danger).SingleLine().MaxWidth(220)
+		}
+	})
 }
 
 // chip is a labelled value in the toolbar, as the proxy's address is.

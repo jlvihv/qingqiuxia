@@ -101,7 +101,6 @@ func tuneRuntime() {
 type config struct {
 	proxyAddr    string
 	apiAddr      string
-	socketPath   string
 	dataDir      string
 	token        string
 	maxBody      int64
@@ -114,9 +113,8 @@ type config struct {
 
 func parseFlags() config {
 	var cfg config
-	flag.StringVar(&cfg.proxyAddr, "proxy", "127.0.0.1:8899", "address the proxy listens on")
+	flag.StringVar(&cfg.proxyAddr, "proxy", "", "address the proxy listens on; empty starts with the proxy stopped, and the window offers a port")
 	flag.StringVar(&cfg.apiAddr, "api", "127.0.0.1:8898", "address the control API listens on, when -headless")
-	flag.StringVar(&cfg.socketPath, "socket", "", "unix socket for the control API; empty uses a private one beside the certificate")
 	flag.StringVar(&cfg.dataDir, "data", defaultDataDir(), "directory for the certificate authority and saved rules")
 	flag.StringVar(&cfg.token, "token", "", "API token; empty means no token, which is only safe on loopback or a socket")
 	flag.Int64Var(&cfg.maxBody, "max-body", proxy.DefaultMaxBodyBytes, "how much of a body to keep for inspection, in bytes")
@@ -161,12 +159,6 @@ type core struct {
 	server   *api.Server
 	pipeline *pipeline.Pipeline
 	cfg      config
-	// apiAddr is what the window connects to: a socket path, or the TCP
-	// address in headless mode.
-	apiAddr string
-	// socketPath is the socket to remove on the way out, empty when the API is
-	// on TCP.
-	socketPath string
 }
 
 // buildCore assembles the proxy, the rules, the session store and the API.
@@ -194,8 +186,14 @@ func buildCore(cfg config) (*core, error) {
 	if cfg.verbose {
 		pr.SetLogger(log.Default())
 	}
-	if err := pr.Listen(cfg.proxyAddr); err != nil {
-		return nil, fmt.Errorf("listen on %s: %w", cfg.proxyAddr, err)
+	// The proxy starts only when an address was asked for. A window that opens
+	// with nothing listening is the normal case: the user picks the port, and
+	// picks it again when it is taken, rather than the program failing to start
+	// because a number it chose for them was busy.
+	if cfg.proxyAddr != "" {
+		if _, err := pr.Start(cfg.proxyAddr); err != nil {
+			return nil, fmt.Errorf("start the proxy on %s: %w", cfg.proxyAddr, err)
+		}
 	}
 
 	server := api.New(api.Core{
@@ -210,35 +208,27 @@ func buildCore(cfg config) (*core, error) {
 		Logger:     log.Default(),
 	}, api.Options{Token: cfg.token})
 
-	// Without a window, the API is reachable on TCP so a script or a browser
-	// can drive it. With one, it is a socket: the window is the only client,
-	// and a socket needs no port, no token and no firewall consideration.
-	apiAddr, socketPath := cfg.socketPath, ""
+	// The API is a network service only when the core has no window: then a
+	// script or a browser is the client. With a window, the window calls the
+	// core directly, in this process, and no port is opened at all.
 	if cfg.headless {
-		apiAddr = cfg.apiAddr
-	} else {
-		if apiAddr == "" {
-			apiAddr = filepath.Join(cfg.dataDir, "core.sock")
+		if err := server.Listen(cfg.apiAddr); err != nil {
+			pr.Close()
+			return nil, fmt.Errorf("listen on %s: %w", cfg.apiAddr, err)
 		}
-		socketPath = apiAddr
 	}
-	if err := server.Listen(apiAddr); err != nil {
-		pr.Close()
-		return nil, fmt.Errorf("listen on %s: %w", apiAddr, err)
-	}
-	return &core{
-		proxy: pr, server: server, pipeline: pol, cfg: cfg,
-		apiAddr: apiAddr, socketPath: socketPath,
-	}, nil
+	return &core{proxy: pr, server: server, pipeline: pol, cfg: cfg}, nil
 }
 
 // log says where the proxy is and what to install.
 func (c *core) log() {
 	log.Printf("qingqiuxia %s", version)
-	log.Printf("proxy   http://%s  (set this as your HTTP and HTTPS proxy)", c.proxy.Addr())
-	if c.socketPath != "" {
-		log.Printf("api     unix://%s", c.socketPath)
+	if addr := c.proxy.Addr(); addr != "" {
+		log.Printf("proxy   http://%s  (set this as your HTTP and HTTPS proxy)", addr)
 	} else {
+		log.Printf("proxy   stopped; choose a port in the window")
+	}
+	if c.cfg.headless {
 		log.Printf("api     http://%s/api/status", c.server.Addr())
 	}
 	log.Printf("ca      %s", filepath.Join(c.cfg.dataDir, "ca.crt"))
@@ -248,7 +238,6 @@ func (c *core) log() {
 // serve runs the core alone until a signal stops it.
 func (c *core) serve(pprofAddr string) error {
 	errs := make(chan error, 2)
-	go func() { errs <- c.proxy.Serve() }()
 	go func() { errs <- c.server.Serve() }()
 	if pprofAddr != "" {
 		go func() { errs <- serveProfiling(pprofAddr) }()
@@ -267,6 +256,10 @@ func (c *core) serve(pprofAddr string) error {
 
 // serveWithWindow runs the core and shows it: the core in goroutines, the
 // window on the main thread, which is where MyGo must run.
+//
+// Nothing here goes over a network. The window holds the core's own types and
+// calls it, so a session reaches the table as the value the proxy recorded,
+// not as JSON that was encoded and decoded to cross a socket.
 func (c *core) serveWithWindow() error {
 	if c.cfg.pprofAddr != "" {
 		go func() {
@@ -274,24 +267,19 @@ func (c *core) serveWithWindow() error {
 			serveProfiling(c.cfg.pprofAddr)
 		}()
 	}
-	go func() {
-		if err := c.proxy.Serve(); err != nil {
-			log.Printf("proxy stopped: %v", err)
-		}
-	}()
-	go func() {
-		if err := c.server.Serve(); err != nil {
-			log.Printf("api stopped: %v", err)
-		}
-	}()
+
+	local := &qqx.Local{
+		Pipeline: c.pipeline,
+		Proxy:    c.proxy,
+		Version:  version,
+		Started:  time.Now(),
+	}
 
 	store := qqx.NewStore(c.cfg.sessionLimit)
 	app := qqx.NewApp(store)
-	// The window starts with the newest row chosen, so the detail panel has
-	// something to show instead of an empty half of the window.
 	app.Selected = 0
+	app.SetBackend(local, local)
 
-	client := qqx.NewUnixClient(c.apiAddr)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -305,7 +293,7 @@ func (c *core) serveWithWindow() error {
 	}
 	app.OnToggleCapture = func(on bool) {
 		go func() {
-			if err := client.SetCapture(ctx, on); err == nil {
+			if err := local.SetCapture(ctx, on); err == nil {
 				app.SetCapturing(on)
 				invalidate()
 			}
@@ -313,7 +301,7 @@ func (c *core) serveWithWindow() error {
 	}
 	app.OnResume = func(id uint64) {
 		go func() {
-			if err := client.Resume(ctx, id); err == nil {
+			if err := local.Resume(ctx, id, false); err == nil {
 				app.ClearPause()
 				invalidate()
 			}
@@ -321,23 +309,54 @@ func (c *core) serveWithWindow() error {
 	}
 	app.OnAbort = func(id uint64) {
 		go func() {
-			if err := client.AbortPause(ctx, id); err == nil {
+			if err := local.Resume(ctx, id, true); err == nil {
 				app.ClearPause()
 				invalidate()
 			}
 		}()
 	}
 
-	go client.Live(ctx, store, invalidate, func() {
-		mygo.RunOnMain(func() {
-			app.InvalidateAppend()
-			if win != nil {
-				win.Invalidate()
-			}
-		})
-	})
-	go followStatus(ctx, client, app, invalidate)
-	go followPauses(ctx, client, app, invalidate)
+	// The proxy's switch: the window offers the port, the core opens it, and a
+	// port that is taken is an error the window shows rather than a start that
+	// fails.
+	app.OnStartProxy = func(addr string) {
+		go func() {
+			got, err := local.StartProxy(addr)
+			mygo.RunOnMain(func() {
+				if err != nil {
+					app.SetProxyError(err)
+				} else {
+					app.SetProxyRunning(got)
+				}
+				if win != nil {
+					win.Invalidate()
+				}
+			})
+		}()
+	}
+	app.OnStopProxy = func() {
+		go func() {
+			err := local.StopProxy()
+			mygo.RunOnMain(func() {
+				if err != nil {
+					app.SetProxyError(err)
+				} else {
+					app.SetProxyStopped()
+				}
+				if win != nil {
+					win.Invalidate()
+				}
+			})
+		}()
+	}
+	// A proxy that was started from the command line shows as running.
+	if running, addr := local.ProxyStatus(); running {
+		app.SetProxyRunning(addr)
+	} else {
+		app.SetProxyStopped()
+	}
+
+	go follow(ctx, local, store, app, invalidate)
 
 	mygo.App.WhenReady(func() {
 		win = mygo.NewWindow(mygo.WindowOptions{
@@ -347,8 +366,6 @@ func (c *core) serveWithWindow() error {
 			Content: ui.View(app.View),
 		})
 	})
-	// A signal closes the window, which is also how the core stops: the
-	// process owns both, so leaving the window ends them together.
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -358,67 +375,70 @@ func (c *core) serveWithWindow() error {
 	return mygo.App.Run()
 }
 
+// follow keeps the window's copy of the core's state current: the traffic
+// through Watch, and the toolbar's description on a slow tick, which is enough
+// for numbers that change when a session does.
+func follow(ctx context.Context, local *qqx.Local, store *qqx.Store, app *qqx.App, invalidate func()) {
+	go func() {
+		_ = local.Watch(ctx, func(ch qqx.Change) {
+			switch ch.Kind {
+			case qqx.ChangeSession:
+				if ch.Session != nil {
+					store.Upsert(*ch.Session)
+				}
+				mygo.RunOnMain(func() {
+					app.InvalidateAppend()
+					invalidate()
+				})
+			case qqx.ChangeDropped:
+				if ch.Session != nil {
+					store.Remove(ch.Session.ID)
+				}
+				mygo.RunOnMain(func() {
+					app.Invalidate()
+					invalidate()
+				})
+			case qqx.ChangePaused:
+				mygo.RunOnMain(func() {
+					app.SetPause(ch.Pause)
+					invalidate()
+				})
+			case qqx.ChangeResumed:
+				mygo.RunOnMain(func() {
+					app.ClearPause()
+					invalidate()
+				})
+			}
+		})
+	}()
+
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		st, err := local.Status(ctx)
+		mygo.RunOnMain(func() {
+			if err != nil {
+				app.SetCoreDown(err)
+			} else {
+				app.SetCoreStatus(st)
+			}
+			if running, addr := local.ProxyStatus(); running {
+				app.SetProxyRunning(addr)
+			}
+			invalidate()
+		})
+	}
+}
+
 // close stops everything, in the order that leaves no client hanging.
 func (c *core) close() {
 	c.server.Close()
 	c.proxy.Close()
-	if c.socketPath != "" {
-		os.Remove(c.socketPath)
-	}
-}
-
-// followStatus keeps the toolbar's description of the core up to date, and
-// reports whether it is running at all.
-func followStatus(ctx context.Context, cl *qqx.Client, app *qqx.App, invalidate func()) {
-	tick := time.NewTicker(2 * time.Second)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-		}
-		st, err := cl.Status(ctx)
-		if err != nil {
-			app.SetCoreDown(err)
-			invalidate()
-			continue
-		}
-		app.SetCoreStatus(st)
-		invalidate()
-	}
-}
-
-// followPauses keeps the breakpoint banner in step with the core.
-func followPauses(ctx context.Context, cl *qqx.Client, app *qqx.App, invalidate func()) {
-	tick := time.NewTicker(time.Second)
-	defer tick.Stop()
-	last := uint64(0)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-		}
-		pauses, err := cl.Pauses(ctx)
-		if err != nil {
-			continue
-		}
-		if len(pauses) == 0 {
-			if last != 0 {
-				app.ClearPause()
-				last = 0
-				invalidate()
-			}
-			continue
-		}
-		p := pauses[0]
-		if p.ID != last {
-			app.SetPause(&p)
-			last = p.ID
-			invalidate()
-		}
-	}
 }
 
 // repeater re-sends a recorded request, for the API's replay call.

@@ -65,25 +65,16 @@ func (r *recorder) Certificate(string) (*tls.Certificate, error) {
 func startProxy(t *testing.T, policy proxy.Policy) string {
 	t.Helper()
 	p := proxy.New(policy, proxy.Tuning{})
-	if err := p.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("listen: %v", err)
+	addr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("start: %v", err)
 	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if err := p.Serve(); err != nil {
-			t.Errorf("serve: %v", err)
-		}
-	}()
 	t.Cleanup(func() {
-		p.Close()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Error("proxy did not stop")
+		if err := p.Stop(); err != nil {
+			t.Errorf("stop: %v", err)
 		}
 	})
-	return p.Addr()
+	return addr
 }
 
 // clientThrough returns an HTTP client that sends everything through proxyAddr.
@@ -287,10 +278,9 @@ func TestConnectTunnelLargeBody(t *testing.T) {
 
 	policy := newRecorder()
 	p := proxy.New(policy, proxy.Tuning{MaxBodyBytes: limit})
-	if err := p.Listen("127.0.0.1:0"); err != nil {
+	if _, err := p.Start("127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
-	go p.Serve()
 	t.Cleanup(func() { p.Close() })
 
 	resp, err := clientThrough(t, p.Addr()).Post(origin.URL, "text/plain", strings.NewReader(payload))

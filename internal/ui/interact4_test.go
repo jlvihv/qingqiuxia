@@ -25,6 +25,9 @@ func TestRecordingToggleCallsBack(t *testing.T) {
 	var calls []bool
 	app, tt := newTesterWith(t, func(a *qqx.App) {
 		a.OnToggleCapture = func(on bool) { calls = append(calls, on) }
+		// The light is a switch only while the proxy listens, so the test
+		// starts it.
+		a.SetProxyRunning("127.0.0.1:8899")
 	}, "https://api.test/v1/x")
 
 	// The button's label is the action it performs, which is what a screen
@@ -38,6 +41,7 @@ func TestRecordingToggleCallsBack(t *testing.T) {
 	}
 
 	app.SetCapturing(false)
+	app.Recording = false
 	tt.Frame()
 	if err := tt.Click("开始录制"); err != nil {
 		t.Fatalf("click again: %v", err)
