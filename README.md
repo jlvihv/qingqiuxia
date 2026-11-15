@@ -55,6 +55,49 @@ curl -s 127.0.0.1:8898/api/sessions | jq '.sessions[0]'
 -v        打印每条连接的错误
 ```
 
+## 给 AI 用
+
+这个 API 的调用方经常是 AI：它拿着 shell 和 curl，要回答"这个请求为什么 500"。
+所以两个数字决定了一切 —— **每次调用花多少 token**，以及**第一次怎么知道能干什么**。
+
+```sh
+curl -s localhost:8898/api          # 入门页：可执行的调用序列，URL 已填好
+```
+
+返回的是纯文本，不是 HTML 或 schema dump，短到能一次读完。
+
+### 要得少，才用得起
+
+一次查询的开销差 46 倍：
+
+```sh
+# 找有没有 5xx —— 195 字节，约 50 tokens
+curl -s 'localhost:8898/api/sessions?status=5xx&shape=table'
+
+# 不加过滤拉 200 条 —— 9144 字节，约 2600 tokens
+curl -s 'localhost:8898/api/sessions?limit=200'
+```
+
+| 参数 | 作用 |
+|---|---|
+| `limit=20` | 行数上限（默认 20，最大 1000） |
+| `since=30s\|5m\|1h` | 只看最近的窗口 |
+| `host=api.foo.com` | 域名，支持 `*.foo.com` |
+| `status=5xx` | 状态类、单码，或 `200,201` |
+| `method=POST` | 方法 |
+| `url=*/login*` | URL 通配；纯字符串是子串匹配，不用写通配符 |
+| `shape=table` | 数组代替对象，**省 60% 字节** |
+| `fields=id,status,url` | 只要这些列 |
+
+一条会话的详情也分档，因为"为什么 500"要的是摘要和响应体，不是请求头：
+
+| 参数 | 大小 |
+|---|---|
+| `part=summary` | 约 230 字节 |
+| `part=headers` | 只有头 |
+| `part=body` | 有 body |
+| `max=2000` | body 截断（会标 `truncated`，不静默丢） |
+
 ## API
 
 全部 JSON，`/api/events` 是 SSE。`apiVersion` 目前是 1。

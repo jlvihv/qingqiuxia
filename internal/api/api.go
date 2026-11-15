@@ -46,6 +46,9 @@ type Core struct {
 	// Resources reports the process's resident memory in megabytes and its
 	// goroutine count, for the window's status bar.
 	Resources func() (memoryMB uint64, goroutines int)
+	// Base is how a caller reaches this API, as "http://127.0.0.1:8898". The
+	// index uses it so its examples can be pasted as they are.
+	Base string
 	// Proxy steers the proxy's own listener. It is what the control API offers
 	// on /api/proxy, and it is separate from the traffic side: the proxy's
 	// address is what a client is pointed at, while this API is what a tool
@@ -57,7 +60,10 @@ type Core struct {
 
 // Server is the control API.
 type Server struct {
-	core  Core
+	core Core
+	// base is how a caller reaches this API, as "http://127.0.0.1:8898": the
+	// index's examples use it so they can be pasted as they are.
+	base  string
 	mux   *http.ServeMux
 	token string
 	srv   *http.Server
@@ -112,6 +118,11 @@ func (s *Server) routes() {
 
 	// The proxy's own listener, which is not this one.
 	s.proxyRoutes()
+
+	// What an agent reads first: how to use this API, in the shape that costs
+	// it the fewest tokens.
+	s.mux.HandleFunc("GET /api", s.handleIndex)
+	s.mux.HandleFunc("GET /api/help", s.handleIndex)
 }
 
 // ServeHTTP applies the token check and then the routes.
@@ -374,23 +385,114 @@ func ms(d time.Duration) float64 {
 
 // handleListSessions returns the traffic list, newest last.
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
-	offset := intParam(r, "offset", 0)
-	limit := intParam(r, "limit", 200)
-	// A negative limit means all, which the store understands as -1.
-	if limit == 0 {
-		limit = 200
+	f, err := parseListFilter(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	list := s.core.Pipeline.Sessions().List(offset, limit)
-	out := make([]sessionJSON, 0, len(list))
-	// A list is rendered newest first, which is what a traffic list shows.
-	for i := len(list) - 1; i >= 0; i-- {
-		out = append(out, toSessionJSON(list[i], false))
+	store := s.core.Pipeline.Sessions()
+	// The filter runs on the server: a caller paying for every byte it reads
+	// asks for the three rows it wants, not two hundred it must sift.
+	all := store.List(0, -1)
+	kept := make([]session.Snapshot, 0, len(all))
+	// Walk newest first, which is the order a traffic list shows.
+	for i := len(all) - 1; i >= 0; i-- {
+		if f.matches(&all[i]) {
+			kept = append(kept, all[i])
+		}
+	}
+	total := len(kept)
+	end := min(f.offset+f.limit, total)
+	if f.offset > total {
+		f.offset = total
+	}
+	kept = kept[f.offset:end]
+
+	if f.table {
+		writeTable(w, f, kept, total, store.Dropped())
+		return
+	}
+	out := make([]sessionJSON, 0, len(kept))
+	for i := range kept {
+		out = append(out, toSessionJSON(kept[i], false))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sessions": out,
-		"total":    s.core.Pipeline.Sessions().Len(),
-		"dropped":  s.core.Pipeline.Sessions().Dropped(),
+		"total":    total,
+		"held":     store.Len(),
+		"dropped":  store.Dropped(),
 	})
+}
+
+// tableColumns are the columns shape=table can carry, in the order they are
+// written when a caller does not choose.
+var tableColumns = []string{
+	"id", "method", "status", "ms", "host", "url", "size", "source", "phase",
+}
+
+// writeTable answers with rows as arrays under a header.
+//
+// An object per row repeats its keys on every row; two hundred rows of
+// {"id":1,"method":"GET",...} is about 40% more bytes than the same data as
+// arrays, which matters when the reader is paying for context.
+func writeTable(w http.ResponseWriter, f listFilter, list []session.Snapshot, total int, dropped uint64) {
+	cols := f.fields
+	if len(cols) == 0 {
+		cols = tableColumns
+	}
+	rows := make([][]any, 0, len(list))
+	for i := range list {
+		rows = append(rows, tableRow(&list[i], cols))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cols":    cols,
+		"rows":    rows,
+		"total":   total,
+		"dropped": dropped,
+	})
+}
+
+// tableRow renders one session as the values of the named columns.
+func tableRow(s *session.Snapshot, cols []string) []any {
+	row := make([]any, len(cols))
+	for i, c := range cols {
+		switch c {
+		case "id":
+			row[i] = s.ID
+		case "method":
+			row[i] = methodOfSession(s)
+		case "status":
+			row[i] = statusOf(s)
+		case "ms":
+			row[i] = round1(s.Timings.Duration().Seconds() * 1000)
+		case "host":
+			row[i] = hostOf(s)
+		case "url":
+			row[i] = urlOf(s)
+		case "size":
+			row[i] = s.BytesOut
+		case "source":
+			row[i] = s.Source.String()
+		case "phase":
+			row[i] = s.Phase.String()
+		default:
+			row[i] = nil
+		}
+	}
+	return row
+}
+
+// statusOf is the response's status, or 0 while there is none.
+func statusOf(s *session.Snapshot) int {
+	if s.Response != nil {
+		return s.Response.Status
+	}
+	return 0
+}
+
+// round1 rounds to one decimal, which is all a millisecond figure needs.
+func round1(v float64) float64 {
+	return float64(int(v*10+0.5)) / 10
 }
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
@@ -398,12 +500,78 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// A caller usually wants one part of an exchange, not all of it: "why did
+	// this answer 500" is the summary and the response body, and the request
+	// headers are noise. The parts are named so that a body of half a megabyte
+	// is not sent to someone who asked about timings.
+	//
+	// The part is checked before the session is looked up: a bad argument is a
+	// bad argument whether or not that id exists, and answering 404 for it sends
+	// the caller looking in the wrong place.
+	q := r.URL.Query()
+	part := q.Get("part")
+	if part == "" {
+		part = "all"
+	}
+	switch part {
+	case "all", "body", "summary", "headers":
+	default:
+		writeError(w, http.StatusBadRequest,
+			"part must be all, summary, headers or body")
+		return
+	}
 	snap, found := s.core.Pipeline.Sessions().Get(id)
 	if !found {
 		writeError(w, http.StatusNotFound, "no session with that id")
 		return
 	}
-	writeJSON(w, http.StatusOK, toSessionJSON(snap, true))
+	maxBody := intParam(r, "max", 0)
+	out := toSessionJSON(snap, false)
+	switch part {
+	case "all", "body":
+		out = toSessionJSON(snap, true)
+	case "summary":
+		// The row, which is what a list already gives, plus what the row
+		// leaves out and a summary does not.
+	case "headers":
+		out = toSessionJSON(snap, false)
+		if snap.Request != nil {
+			out.Request = headersOnly(&snap.Request.Message, maxBody)
+		}
+		if snap.Response != nil {
+			out.Response = headersOnly(&snap.Response.Message, maxBody)
+		}
+	}
+	if maxBody > 0 {
+		truncateBodies(out.Request, maxBody)
+		truncateBodies(out.Response, maxBody)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// headersOnly describes a message's headers without its body.
+func headersOnly(m *msg.Message, _ int) *messageJSON {
+	if m == nil {
+		return nil
+	}
+	return &messageJSON{
+		Headers:     map[string][]string(m.Header),
+		ContentType: m.Header.Get("Content-Type"),
+		Truncated:   m.Truncated,
+		Streaming:   m.Stream != nil,
+	}
+}
+
+// truncateBodies cuts a body to at most n bytes, saying that it did: a body
+// that stops early without saying so reads as a broken tool.
+func truncateBodies(m *messageJSON, n int) {
+	if m == nil || len(m.Body) <= n {
+		return
+	}
+	// The body may be base64, which does not cut on a byte boundary; cutting
+	// the text is enough for a reader, and the size is in the row anyway.
+	m.Body = m.Body[:n]
+	m.Truncated = true
 }
 
 func (s *Server) handleClearSessions(w http.ResponseWriter, r *http.Request) {
