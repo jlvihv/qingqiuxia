@@ -5,7 +5,9 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jlvihv/qingqiuxia/internal/codec"
 	"github.com/jlvihv/qingqiuxia/internal/msg"
 )
 
@@ -76,7 +78,7 @@ func TestResponseRewriteKeepsEncoding(t *testing.T) {
 
 	// A gzipped body must come back gzipped, with the same header.
 	plain := []byte(`{"token":"secret-12345"}`)
-	gz, err := encodeBody(plain, "gzip")
+	gz, err := codec.Encode(plain, "gzip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +88,7 @@ func TestResponseRewriteKeepsEncoding(t *testing.T) {
 	if _, err := e.Response(req(t, "GET", "https://x.test/", nil), resp); err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := decodeBody(&resp.Message)
+	decoded, err := codec.Decode(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
 		t.Fatalf("the rewritten body must still be gzipped: %v", err)
 	}
@@ -233,5 +235,79 @@ func TestReplaceIsAtomic(t *testing.T) {
 	}
 	if e.Len() != 1 {
 		t.Errorf("rules = %d after a failed replace", e.Len())
+	}
+}
+
+// TestSetBodyKeepsEncoding checks that replacing a body does not leave plain
+// text under a Content-Encoding header, which a client cannot decode.
+func TestSetBodyKeepsEncoding(t *testing.T) {
+	e := NewEngine()
+	if err := e.Replace([]Spec{{
+		Name: "replace all", Kind: "rewrite", Phase: "response", Pattern: "*",
+		Actions: []ActionSpec{{Type: "set-body", Value: `{"replaced":true}`}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	resp := &msg.Response{Status: 200}
+	resp.Header = http.Header{"Content-Encoding": {"gzip"}, "Content-Type": {"application/json"}}
+	resp.Body = []byte("not really gzip")
+	if _, err := e.Response(req(t, "GET", "https://x.test/", nil), resp); err != nil {
+		t.Fatal(err)
+	}
+	// The body must decode as the header says it is.
+	decoded, err := codec.Decode(resp.Body, "gzip")
+	if err != nil {
+		t.Fatalf("the body does not decode as gzip: %v", err)
+	}
+	if string(decoded) != `{"replaced":true}` {
+		t.Errorf("decoded = %q", decoded)
+	}
+}
+
+// TestRuleDelay checks that a rule's own delay reaches the outcome, which is
+// how a slow network is simulated for one endpoint.
+func TestRuleDelay(t *testing.T) {
+	e := NewEngine()
+	e.Replace([]Spec{{
+		Name: "slow", Kind: "rewrite", Phase: "request", Pattern: "*/slow",
+		Delay:   250,
+		Actions: []ActionSpec{{Type: "set-header", Name: "X-Slow", Value: "1"}},
+	}})
+	out, err := e.Request(req(t, "GET", "https://x.test/slow", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Delay != 250*time.Millisecond {
+		t.Errorf("delay = %v", out.Delay)
+	}
+	// A rule that does not match leaves no delay.
+	out, _ = e.Request(req(t, "GET", "https://x.test/fast", nil))
+	if out.Delay != 0 {
+		t.Errorf("unmatched delay = %v", out.Delay)
+	}
+}
+
+// TestRedirectAction checks that a redirect drops the body and sets Location.
+func TestRedirectAction(t *testing.T) {
+	e := NewEngine()
+	e.Replace([]Spec{{
+		Name: "moved", Kind: "rewrite", Phase: "response", Pattern: "*",
+		Actions: []ActionSpec{{Type: "redirect", Value: "https://new.test/", Status: 301}},
+	}})
+	resp := &msg.Response{Status: 200}
+	resp.Header = http.Header{"Content-Type": {"text/html"}}
+	resp.Body = []byte("<html>old</html>")
+	resp.SetHeader("Content-Length", "16")
+	if _, err := e.Response(req(t, "GET", "https://x.test/", nil), resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != 301 {
+		t.Errorf("status = %d", resp.Status)
+	}
+	if got := resp.Header.Get("Location"); got != "https://new.test/" {
+		t.Errorf("Location = %q", got)
+	}
+	if len(resp.Body) != 0 {
+		t.Errorf("the body survived: %q", resp.Body)
 	}
 }

@@ -129,7 +129,6 @@ func TestMockSession(t *testing.T) {
 	if dec.Mock == nil {
 		t.Fatal("no mock")
 	}
-	ex.Mocked = true
 	p.Complete(ex, dec.Mock, nil)
 	snap, _ := sessions.Get(ex.ID)
 	if snap.Source != session.Mocked {

@@ -88,14 +88,6 @@ type Paused struct {
 	// decided wakes the waiting proxy goroutine exactly once.
 	decideOnce sync.Once
 	decision   chan Decision
-	final      atomic.Pointer[pausedState]
-}
-
-// pausedState is what the API reads with the mutex held while a decision is
-// being made.
-type pausedState struct {
-	req  *msg.Request
-	resp *msg.Response
 }
 
 // Send decides what happens to the paused message. It returns false when the
@@ -107,22 +99,6 @@ func (p *Paused) Send(d Decision) bool {
 		sent = true
 	})
 	return sent
-}
-
-// Request returns the paused request as it currently stands, after any edits.
-func (p *Paused) CurrentRequest() *msg.Request {
-	if s := p.final.Load(); s != nil {
-		return s.req
-	}
-	return p.Request
-}
-
-// CurrentResponse returns the paused response, after any edits.
-func (p *Paused) CurrentResponse() *msg.Response {
-	if s := p.final.Load(); s != nil {
-		return s.resp
-	}
-	return p.Response
 }
 
 // Manager holds the breakpoint rules and the paused messages.
@@ -292,14 +268,6 @@ func (m *Manager) Pending() []*Paused {
 		}
 	}
 	return out
-}
-
-// Paused returns one pause by ID.
-func (m *Manager) PausedFor(sessionID uint64) (*Paused, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	p, ok := m.bySession[sessionID]
-	return p, ok
 }
 
 // match returns the first breakpoint rule that applies, or nil.

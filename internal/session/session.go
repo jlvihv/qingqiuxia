@@ -138,9 +138,6 @@ type Session struct {
 	notes    []Note
 	bytesIn  int64
 	bytesOut int64
-	// revision counts changes, so the store publishes only what is new. It
-	// is read without the lock, hence the atomic.
-	revision atomic.Uint64
 	// aborted asks the proxy to stop forwarding, set by a rule through the
 	// pipeline's view of the session.
 	aborted bool
@@ -177,7 +174,6 @@ func (s *Session) Snapshot() Snapshot {
 func (s *Session) SetSource(src Source) {
 	s.mu.Lock()
 	s.source = src
-	s.revision.Add(1)
 	s.mu.Unlock()
 }
 
@@ -185,7 +181,6 @@ func (s *Session) SetSource(src Source) {
 func (s *Session) SetDNS(d time.Duration) {
 	s.mu.Lock()
 	s.timings.DNS = d
-	s.revision.Add(1)
 	s.mu.Unlock()
 }
 
@@ -193,7 +188,6 @@ func (s *Session) SetDNS(d time.Duration) {
 func (s *Session) SetConnect(d time.Duration) {
 	s.mu.Lock()
 	s.timings.Connect = d
-	s.revision.Add(1)
 	s.mu.Unlock()
 }
 
@@ -201,7 +195,6 @@ func (s *Session) SetConnect(d time.Duration) {
 func (s *Session) SetTLS(d time.Duration) {
 	s.mu.Lock()
 	s.timings.TLS = d
-	s.revision.Add(1)
 	s.mu.Unlock()
 }
 
@@ -209,7 +202,17 @@ func (s *Session) SetTLS(d time.Duration) {
 func (s *Session) SetTTFB(d time.Duration) {
 	s.mu.Lock()
 	s.timings.TTFB = d
-	s.revision.Add(1)
+	s.mu.Unlock()
+}
+
+// SetTimings records where the exchange's time went, in one lock rather than
+// one per field.
+func (s *Session) SetTimings(t Timings) {
+	s.mu.Lock()
+	s.timings.DNS = t.DNS
+	s.timings.Connect = t.Connect
+	s.timings.TLS = t.TLS
+	s.timings.TTFB = t.TTFB
 	s.mu.Unlock()
 }
 
@@ -217,29 +220,13 @@ func (s *Session) SetTTFB(d time.Duration) {
 func (s *Session) SetResponse(resp *msg.Response) {
 	s.mu.Lock()
 	s.resp = resp
-	s.revision.Add(1)
 	s.mu.Unlock()
-}
-
-// Response returns the current response, or nil.
-func (s *Session) Response() *msg.Response {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.resp
-}
-
-// Request returns the request as it currently stands, after any rule edits.
-func (s *Session) Request() *msg.Request {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.req
 }
 
 // SetRequest replaces the request, after a rule or a breakpoint edited it.
 func (s *Session) SetRequest(req *msg.Request) {
 	s.mu.Lock()
 	s.req = req
-	s.revision.Add(1)
 	s.mu.Unlock()
 }
 
@@ -252,7 +239,6 @@ func (s *Session) AddNote(n Note) {
 	if len(s.notes) < maxNotes {
 		s.notes = append(s.notes, n)
 	}
-	s.revision.Add(1)
 	s.mu.Unlock()
 }
 
@@ -260,7 +246,6 @@ func (s *Session) AddNote(n Note) {
 func (s *Session) Abort() {
 	s.mu.Lock()
 	s.aborted = true
-	s.revision.Add(1)
 	s.mu.Unlock()
 }
 
@@ -288,17 +273,13 @@ func (s *Session) Complete(resp *msg.Response, err error, now time.Time) {
 	} else {
 		s.phase = Complete
 	}
-	if s.source == Proxied && resp == nil && err == nil {
+	// A session nothing answered is an abort, whatever the rules called it.
+	// The check is on the outcome, not on the previous source: a mock that
+	// produced no response is still an abort.
+	if err == nil && resp == nil && s.source != Mocked {
 		s.source = Aborted
 	}
-	s.revision.Add(1)
 	s.mu.Unlock()
-}
-
-// Revision reports how many changes the session has seen, so a publisher can
-// skip frames nothing changed in.
-func (s *Session) Revision() uint64 {
-	return s.revision.Load()
 }
 
 // Store keeps the recent sessions in a bounded ring and publishes changes.
@@ -396,11 +377,14 @@ func (s *Store) Publish(sess *Session) {
 	if s.hub.Len() == 0 {
 		return
 	}
+	// One snapshot, not two: the phase comes out of the same copy that is
+	// published.
+	snap := sess.Snapshot()
 	kind := EventUpdate
-	if p := sess.Snapshot().Phase; p != Pending {
+	if snap.Phase != Pending {
 		kind = EventDone
 	}
-	s.hub.Publish(Event{Kind: kind, Session: sess.Snapshot()})
+	s.hub.Publish(Event{Kind: kind, Session: snap})
 }
 
 // Get returns a session's snapshot by ID.

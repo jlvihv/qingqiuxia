@@ -38,6 +38,42 @@ func RemoveHopHeaders(h http.Header) {
 	}
 }
 
+// CloneWithoutHopHeaders returns a copy of h without the hop-by-hop headers, in
+// one pass: the proxy needs this for every request it forwards, so it does not
+// build a full copy and then delete from it.
+func CloneWithoutHopHeaders(h http.Header) http.Header {
+	// The fields Connection names are hop-by-hop too, so collect them first.
+	var named map[string]bool
+	for _, v := range h["Connection"] {
+		for _, field := range strings.Split(v, ",") {
+			if field = strings.TrimSpace(field); field != "" {
+				if named == nil {
+					named = make(map[string]bool, 4)
+				}
+				named[http.CanonicalHeaderKey(field)] = true
+			}
+		}
+	}
+	out := make(http.Header, len(h))
+	for k, vv := range h {
+		if named[k] || isHopHeader(k) {
+			continue
+		}
+		out[k] = append([]string(nil), vv...)
+	}
+	return out
+}
+
+// isHopHeader reports whether a canonical header name is hop-by-hop.
+func isHopHeader(name string) bool {
+	switch name {
+	case "Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
+		"Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade":
+		return true
+	}
+	return false
+}
+
 // CopyHeader replaces dst's contents with src's.
 //
 // The values are appended into dst's existing slices where they fit, so that a

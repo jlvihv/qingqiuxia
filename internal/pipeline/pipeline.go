@@ -10,7 +10,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -62,9 +61,6 @@ type Pipeline struct {
 	// sessions maps an exchange to the session it records into. The proxy
 	// hands the exchange back unchanged, so the ID lives here rather than in
 	// the exchange, which keeps the proxy's type free of the store's.
-	mu       sync.Mutex
-	inFlight map[uint64]*session.Session
-	nextKey  atomic.Uint64
 	// recording reports whether new exchanges are recorded.
 	recording atomic.Bool
 }
@@ -77,7 +73,6 @@ func New(opts Options) *Pipeline {
 		sessions:    opts.Sessions,
 		issuer:      opts.Issuer,
 		intercept:   opts.ShouldIntercept,
-		inFlight:    make(map[uint64]*session.Session, 64),
 	}
 	if p.rules == nil {
 		p.rules = rule.NewEngine()
@@ -129,9 +124,10 @@ func (p *Pipeline) Begin(ex *proxy.Exchange) {
 	}
 	sess := p.sessions.Begin(ex.Request, ex.Started)
 	ex.ID = sess.ID
-	p.mu.Lock()
-	p.inFlight[ex.ID] = sess
-	p.mu.Unlock()
+	// The exchange carries the session, so Request, Response and Complete need
+	// no lookup and no lock: the policy's state travels with the exchange it
+	// belongs to.
+	ex.Policy = sess
 }
 
 // Request runs the request rules and breakpoints.
@@ -240,36 +236,21 @@ func (p *Pipeline) Complete(ex *proxy.Exchange, resp *msg.Response, err error) {
 	if sess == nil {
 		return
 	}
-	p.mu.Lock()
-	delete(p.inFlight, ex.ID)
-	p.mu.Unlock()
-
-	if dns, connect, tlsTime := ex.Timings(); dns != 0 || connect != 0 || tlsTime != 0 {
-		if dns != 0 {
-			sess.SetDNS(dns)
-		}
-		if connect != 0 {
-			sess.SetConnect(connect)
-		}
-		if tlsTime != 0 {
-			sess.SetTLS(tlsTime)
-		}
-	}
-	if ttfb := ex.TimeToFirstByte(); ttfb != 0 {
-		sess.SetTTFB(ttfb)
-	}
+	// One call records the whole timing, rather than four setters that each
+	// took the session's lock.
+	t := ex.Timings()
+	sess.SetTimings(session.Timings{DNS: t.DNS, Connect: t.Connect, TLS: t.TLS, TTFB: t.TTFB})
 	sess.Complete(resp, err, time.Now())
 	p.sessions.Publish(sess)
 }
 
-// sessionFor returns the session an exchange records into.
+// sessionFor returns the session an exchange records into, which Begin put on
+// the exchange itself.
 func (p *Pipeline) sessionFor(ex *proxy.Exchange) *session.Session {
-	if ex == nil || ex.ID == 0 {
+	if ex == nil {
 		return nil
 	}
-	p.mu.Lock()
-	sess := p.inFlight[ex.ID]
-	p.mu.Unlock()
+	sess, _ := ex.Policy.(*session.Session)
 	return sess
 }
 

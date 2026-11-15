@@ -8,8 +8,26 @@ import (
 	"time"
 )
 
-// httptraceTimes collects the origin connection's setup times, so a session can
-// show where its time went.
+// Timings is where an exchange's time went: the origin connection's setup and
+// the wait for the first response byte.
+//
+// It is exported because the policy records it on the session, which is what
+// the traffic list shows.
+type Timings struct {
+	// DNS, Connect and TLS are the origin connection's setup, zero when a
+	// connection was reused.
+	DNS, Connect, TLS time.Duration
+	// TTFB is from the start of the request to the first body byte.
+	TTFB time.Duration
+}
+
+// IsZero reports whether nothing was recorded, which is the case for a reused
+// connection whose response the caller did not measure.
+func (t Timings) IsZero() bool {
+	return t.DNS == 0 && t.Connect == 0 && t.TLS == 0 && t.TTFB == 0
+}
+
+// httptraceTimes collects the origin connection's setup times.
 //
 // net/http calls the trace hooks from several goroutines of its own: the dial,
 // the TLS handshake and the request's own path can overlap, so the fields are
@@ -57,32 +75,32 @@ func httptraceWithTimes(ctx context.Context, t *httptraceTimes) context.Context 
 	return httptrace.WithClientTrace(ctx, trace)
 }
 
-// fill copies the collected times onto the exchange. A reused connection has no
-// setup to report, and leaves the fields at zero.
-func (t *httptraceTimes) fill(ex *Exchange) {
+// collect returns the setup times, with ttfb from the caller's own clock.
+func (t *httptraceTimes) collect(ttfb time.Duration) Timings {
 	t.mu.Lock()
 	start, dns, connect, tlsDone := t.start, t.dnsDone, t.connectDone, t.tlsDone
 	t.mu.Unlock()
+
+	out := Timings{TTFB: ttfb}
 	if start.IsZero() {
-		return
+		return out
 	}
-	ex.mu.Lock()
-	defer ex.mu.Unlock()
 	if !dns.IsZero() {
-		ex.timings.DNS = dns.Sub(start)
+		out.DNS = dns.Sub(start)
 	}
 	if !connect.IsZero() {
 		base := start
 		if !dns.IsZero() {
 			base = dns
 		}
-		ex.timings.Connect = connect.Sub(base)
+		out.Connect = connect.Sub(base)
 	}
 	if !tlsDone.IsZero() {
 		base := start
 		if !connect.IsZero() {
 			base = connect
 		}
-		ex.timings.TLS = tlsDone.Sub(base)
+		out.TLS = tlsDone.Sub(base)
 	}
+	return out
 }

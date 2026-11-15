@@ -8,6 +8,7 @@ package api
 
 import (
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jlvihv/qingqiuxia/internal/breakpoint"
+	"github.com/jlvihv/qingqiuxia/internal/msg"
 	"github.com/jlvihv/qingqiuxia/internal/pipeline"
 	"github.com/jlvihv/qingqiuxia/internal/rule"
 	"github.com/jlvihv/qingqiuxia/internal/session"
@@ -314,7 +316,7 @@ func toSessionJSON(s session.Snapshot, detail bool) sessionJSON {
 }
 
 // toMessageJSON describes a message's headers and body.
-func toMessageJSON(m *msgMessage) messageJSON {
+func toMessageJSON(m *msg.Message) messageJSON {
 	out := messageJSON{
 		Headers:     map[string][]string(m.Header),
 		ContentType: m.Header.Get("Content-Type"),
@@ -322,11 +324,11 @@ func toMessageJSON(m *msgMessage) messageJSON {
 		Streaming:   m.Stream != nil,
 	}
 	if len(m.Body) > 0 {
-		if IsTextBody(m.Header.Get("Content-Type")) {
+		if msg.IsText(m.ContentType()) {
 			out.Body = string(m.Body)
 			out.BodyEncoding = "text"
 		} else {
-			out.Body = base64Encode(m.Body)
+			out.Body = base64.StdEncoding.EncodeToString(m.Body)
 			out.BodyEncoding = "base64"
 		}
 	}

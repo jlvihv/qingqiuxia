@@ -53,14 +53,17 @@ func captureRequest(r *http.Request, limit int64) (*msg.Request, io.Reader, erro
 // captureResponse turns an origin response into the message model, keeping the
 // body within limit. A body past the limit is kept in part and marked
 // truncated, and the rest is drained so the connection can be reused.
-func captureResponse(raw *http.Response, limit int64, start time.Time) (*msg.Response, *Exchange, error) {
+//
+// It returns the response and the time to its first body byte, which is zero
+// for a response without a body.
+func captureResponse(raw *http.Response, limit int64, start time.Time) (*msg.Response, time.Duration, error) {
 	resp := &msg.Response{
 		Status:  raw.StatusCode,
 		Proto:   raw.Proto,
 		Message: msg.Message{Header: raw.Header},
 	}
 	if raw.StatusCode == http.StatusNoContent || raw.StatusCode == http.StatusNotModified {
-		return resp, nil, nil
+		return resp, 0, nil
 	}
 	mediaType := msg.MediaType(raw.Header.Get("Content-Type"))
 
@@ -68,7 +71,7 @@ func captureResponse(raw *http.Response, limit int64, start time.Time) (*msg.Res
 	// come, and a debugger that waited for the end would see none.
 	if msg.IsStreaming(mediaType) {
 		resp.Stream = raw.Body
-		return resp, nil, nil
+		return resp, time.Since(start), nil
 	}
 
 	// The read buffer comes from a pool: a 32 KiB allocation per response was
@@ -103,12 +106,12 @@ func captureResponse(raw *http.Response, limit int64, start time.Time) (*msg.Res
 			break
 		}
 		if err != nil {
-			return resp, nil, err
+			return resp, ttfb, err
 		}
 	}
 	resp.Body = body
 	resp.Truncated = limit > 0 && total > limit
-	return resp, &Exchange{ttfb: ttfb}, nil
+	return resp, ttfb, nil
 }
 
 // cloneURL copies a URL.

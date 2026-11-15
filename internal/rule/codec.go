@@ -15,9 +15,6 @@ func decodeBody(m *msg.Message) ([]byte, error) {
 	return codec.Decode(m.Body, m.Header.Get("Content-Encoding"))
 }
 
-// encodeBody applies a content coding, for the tests.
-func encodeBody(b []byte, ce string) ([]byte, error) { return codec.Encode(b, ce) }
-
 // setEncodedBody applies text to a message as its body, re-applying the
 // content coding the message arrived with.
 func setEncodedBody(m *msg.Message, text []byte) error {

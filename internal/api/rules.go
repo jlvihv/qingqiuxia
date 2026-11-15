@@ -3,22 +3,11 @@ package api
 import (
 	"encoding/base64"
 	"net/http"
-	"strings"
 
 	"github.com/jlvihv/qingqiuxia/internal/breakpoint"
 	"github.com/jlvihv/qingqiuxia/internal/msg"
 	"github.com/jlvihv/qingqiuxia/internal/rule"
-	"github.com/jlvihv/qingqiuxia/internal/session"
 )
-
-// msgMessage is the message type the API reads headers and bodies from. It is
-// an alias so that the API's helpers read as if they took the model directly.
-type msgMessage = msg.Message
-
-// IsTextBody reports whether a body is worth sending as text.
-func IsTextBody(contentType string) bool { return msg.IsText(msg.MediaType(contentType)) }
-
-func base64Encode(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
 // handleListRules returns the rules.
 func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {
@@ -43,8 +32,6 @@ type ruleView struct {
 	Phase   string   `json:"phase"`
 	Pattern string   `json:"pattern"`
 	Effects []string `json:"effects,omitempty"`
-	// Matched counts what the rule has changed since the core started.
-	Matched int64 `json:"matched"`
 }
 
 func toRuleView(r *rule.Rule) ruleView {
@@ -319,12 +306,9 @@ func (s *Server) handleCertificate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"pem": string(ca),
 		// The same certificate, one line, for a GUI that shows a fingerprint.
-		"pemBase64": base64Encode(ca),
+		"pemBase64": base64.StdEncoding.EncodeToString(ca),
 	})
 }
 
 // rfc3339Nano is the timestamp layout the API uses.
 const rfc3339Nano = "2006-01-02T15:04:05.999999999Z07:00"
-
-var _ = strings.TrimSpace
-var _ = session.Pending

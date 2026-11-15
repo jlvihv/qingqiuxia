@@ -9,6 +9,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -19,7 +20,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -147,47 +147,29 @@ type Exchange struct {
 	Request *msg.Request
 	// Response is the response, once there is one.
 	Response *msg.Response
-	// Intercepted reports that the connection's TLS was decrypted, so the
-	// request is what the client actually sent.
-	Intercepted bool
-	// ClientAddr is the client's address, and Device its IP without the port,
-	// for grouping traffic by device.
-	ClientAddr string
-	Device     string
 	// Started is when the exchange began.
 	Started time.Time
-	// Mocked reports that a rule answered instead of the origin.
-	Mocked bool
-	// Aborted reports that a rule refused the request.
-	Aborted bool
-	// Streamed reports that the response body is a live stream.
-	Streamed bool
 
-	mu      sync.Mutex
-	ttfb    time.Duration
-	timings struct{ DNS, Connect, TLS time.Duration }
+	mu    sync.Mutex
+	times Timings
+
+	// Policy is a slot the policy may use to keep its own state for an
+	// exchange, so that a policy need not index every in-flight exchange in a
+	// shared map: the proxy only carries the value from Begin to Complete.
+	Policy any
 }
 
-// Timings returns the origin connection's setup times.
-func (ex *Exchange) Timings() (dns, connect, tls time.Duration) {
+// Timings returns where the exchange's time went.
+func (ex *Exchange) Timings() Timings {
 	ex.mu.Lock()
 	defer ex.mu.Unlock()
-	return ex.timings.DNS, ex.timings.Connect, ex.timings.TLS
+	return ex.times
 }
 
-// TimeToFirstByte returns when the response's first body byte arrived, or 0.
-func (ex *Exchange) TimeToFirstByte() time.Duration {
+// setTimings records where the exchange's time went.
+func (ex *Exchange) setTimings(t Timings) {
 	ex.mu.Lock()
-	defer ex.mu.Unlock()
-	return ex.ttfb
-}
-
-// setTTFB records when the response's first body byte arrived.
-func (ex *Exchange) setTTFB(d time.Duration) {
-	ex.mu.Lock()
-	if ex.ttfb == 0 {
-		ex.ttfb = d
-	}
+	ex.times = t
 	ex.mu.Unlock()
 }
 
@@ -209,13 +191,9 @@ func (p *Proxy) Listen(addr string) error {
 //
 // The response is discarded; the session holds it.
 func (p *Proxy) Replay(ctx context.Context, req *msg.Request) error {
-	ex := &Exchange{
-		Started:    time.Now(),
-		Request:    req.Clone(),
-		ClientAddr: "replay",
-		Device:     "replay",
-	}
-	ex.Request.URL = cloneURL(req.URL)
+	// Clone once: the replayed request is edited by rules, and the snapshot it
+	// came from belongs to the session store.
+	ex := &Exchange{Started: time.Now(), Request: req.Clone()}
 	p.policy.Begin(ex)
 
 	decision, err := p.policy.Request(ctx, ex)
@@ -223,25 +201,25 @@ func (p *Proxy) Replay(ctx context.Context, req *msg.Request) error {
 		p.policy.Complete(ex, nil, err)
 		return err
 	}
-	if decision.Abort {
-		p.policy.Complete(ex, nil, fmt.Errorf("a rule aborted the replay"))
+	if decision.Abort || decision.Mock != nil {
+		resp := decision.Mock
+		if resp == nil {
+			resp = statusResponse(decision.Status)
+		}
+		ex.Response = resp
+		p.policy.Complete(ex, resp, nil)
 		return nil
 	}
-	if decision.Mock != nil {
-		ex.Mocked = true
-		p.policy.Complete(ex, decision.Mock, nil)
-		return nil
-	}
-	resp, err := p.roundTrip(ctx, ex, ex.Request, nil)
+	resp, times, err := p.roundTrip(ctx, ex.Request, nil)
 	if err != nil {
 		p.policy.Complete(ex, nil, err)
 		return err
 	}
-	ex.Response = resp
+	ex.setTimings(times)
 	if final, err := p.policy.Response(ctx, ex, resp); err == nil && final != nil {
 		resp = final
-		ex.Response = resp
 	}
+	ex.Response = resp
 	p.policy.Complete(ex, resp, nil)
 	return nil
 }
@@ -581,12 +559,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // forward runs one exchange: capture, policy, origin, policy, response.
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ex := &Exchange{
-		Started:     time.Now(),
-		Intercepted: r.TLS != nil,
-		ClientAddr:  r.RemoteAddr,
-		Device:      deviceOf(r.RemoteAddr),
-	}
+	ex := &Exchange{Started: time.Now()}
 
 	// Read the request body, up to the inspection limit. A body that goes past
 	// it is forwarded in full: the session keeps the start, the client's bytes
@@ -616,56 +589,57 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if decision.Abort {
-		ex.Aborted = true
-		status := decision.Status
-		if status == 0 {
-			status = http.StatusForbidden
+	// A rule may answer the request itself, which ends the exchange here.
+	if decision.Abort || decision.Mock != nil {
+		resp := decision.Mock
+		if resp == nil {
+			resp = statusResponse(decision.Status)
 		}
-		resp := &msg.Response{
-			Status:  status,
-			Reason:  http.StatusText(status),
-			Message: msg.Message{Header: http.Header{}},
-		}
-		ex.Response = resp
-		p.policy.Complete(ex, resp, nil)
-		writeResponse(w, r, resp)
-		return
-	}
-	if decision.Mock != nil {
-		ex.Mocked = true
-		ex.Response = decision.Mock
-		p.policy.Complete(ex, decision.Mock, nil)
-		writeResponse(w, r, decision.Mock)
+		p.finish(w, r, ex, resp, nil)
 		return
 	}
 
-	resp, err := p.roundTrip(ctx, ex, req, overflow)
+	resp, times, err := p.roundTrip(ctx, req, overflow)
 	if err != nil {
 		p.policy.Complete(ex, nil, err)
 		writeError(w, err)
 		return
 	}
-	ex.Response = resp
+	ex.setTimings(times)
 	final, err := p.policy.Response(ctx, ex, resp)
-	if err != nil {
-		p.policy.Complete(ex, resp, err)
-		writeResponse(w, r, resp)
-		return
-	}
-	if final != nil {
+	if err == nil && final != nil {
 		resp = final
-		ex.Response = resp
 	}
-	p.policy.Complete(ex, resp, nil)
+	// A failing response rule still delivers the response: the client asked
+	// for it, and a rule is the debugger's business, not the client's.
+	p.finish(w, r, ex, resp, err)
+}
+
+// finish records the end of an exchange and sends the response, so that every
+// way an exchange can end takes the same path.
+func (p *Proxy) finish(w http.ResponseWriter, r *http.Request, ex *Exchange, resp *msg.Response, err error) {
+	ex.Response = resp
+	p.policy.Complete(ex, resp, err)
 	writeResponse(w, r, resp)
 }
 
+// statusResponse is the empty response an abort answers with.
+func statusResponse(status int) *msg.Response {
+	if status == 0 {
+		status = http.StatusForbidden
+	}
+	return &msg.Response{
+		Status:  status,
+		Reason:  http.StatusText(status),
+		Message: msg.Message{Header: http.Header{}},
+	}
+}
+
 // roundTrip sends the request to the origin and captures the response.
-func (p *Proxy) roundTrip(ctx context.Context, ex *Exchange, req *msg.Request, overflow io.Reader) (*msg.Response, error) {
-	outReq, err := p.buildUpstreamRequest(ctx, ex, req, overflow)
+func (p *Proxy) roundTrip(ctx context.Context, req *msg.Request, overflow io.Reader) (*msg.Response, Timings, error) {
+	outReq, err := p.buildUpstreamRequest(ctx, req, overflow)
 	if err != nil {
-		return nil, err
+		return nil, Timings{}, err
 	}
 
 	transport := p.transportFor(req.URL.Scheme)
@@ -675,32 +649,29 @@ func (p *Proxy) roundTrip(ctx context.Context, ex *Exchange, req *msg.Request, o
 	start := time.Now()
 	raw, err := transport.RoundTrip(outReq)
 	if err != nil {
-		return nil, unwrapURLError(err)
+		return nil, Timings{}, unwrapURLError(err)
 	}
 
-	resp, meta, err := captureResponse(raw, p.tune.MaxBodyBytes, start)
+	resp, ttfb, err := captureResponse(raw, p.tune.MaxBodyBytes, start)
 	// A captured body is read to the end, so its stream can be closed; a
 	// stream is passed to the client, which closes it by closing the response.
 	if resp == nil || resp.Stream == nil {
 		defer raw.Body.Close()
 	}
 	if err != nil {
-		return nil, err
+		return nil, Timings{}, err
 	}
-	if meta != nil {
-		ex.setTTFB(meta.ttfb)
-		ex.Streamed = resp.Stream != nil
-	}
-	trace.fill(ex)
-	return resp, nil
+	return resp, trace.collect(ttfb), nil
 }
 
 // buildUpstreamRequest turns a captured request into the one to send.
-func (p *Proxy) buildUpstreamRequest(ctx context.Context, ex *Exchange, req *msg.Request, overflow io.Reader) (*http.Request, error) {
+func (p *Proxy) buildUpstreamRequest(ctx context.Context, req *msg.Request, overflow io.Reader) (*http.Request, error) {
 	u := *req.URL
 	body := io.Reader(nil)
 	if len(req.Body) > 0 {
-		body = strings.NewReader(string(req.Body))
+		// bytes.NewReader, not strings.NewReader(string(b)): the latter copies
+		// the whole body to make it a string, for no gain.
+		body = bytes.NewReader(req.Body)
 	}
 	// An overflowing body continues from where the capture stopped; the two
 	// readers are joined so the origin sees the whole body.
@@ -715,8 +686,10 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, ex *Exchange, req *msg
 	if err != nil {
 		return nil, err
 	}
-	outReq.Header = req.Header.Clone()
-	httpx.RemoveHopHeaders(outReq.Header)
+	// The upstream request gets its own header map: the captured one belongs to
+	// the session, which a GUI may be reading, and hop-by-hop headers have to
+	// be dropped from this copy alone.
+	outReq.Header = httpx.CloneWithoutHopHeaders(req.Header)
 	// The proxy speaks its own connection's negotiation to the origin.
 	outReq.Header.Del("Accept-Encoding")
 	if overflow != nil {
@@ -826,14 +799,6 @@ func writeError(w http.ResponseWriter, err error) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
 	fmt.Fprintf(w, "qingqiuxia: %v\n", err)
-}
-
-// deviceOf returns the client's address without its port.
-func deviceOf(addr string) string {
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		return host
-	}
-	return addr
 }
 
 // unwrapURLError digs the underlying error out of a *url.Error, whose message

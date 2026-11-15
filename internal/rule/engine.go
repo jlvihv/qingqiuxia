@@ -128,19 +128,3 @@ func (e *Engine) Response(req *msg.Request, resp *msg.Response) ([]Applied, erro
 	}
 	return applied, nil
 }
-
-// Matches reports whether any enabled rule in the phase applies to the
-// exchange, so the proxy can skip work that no rule will touch.
-func (e *Engine) Matches(phase Phase, req *msg.Request) bool {
-	rs := e.current.Load()
-	if len(rs.rules) == 0 {
-		return false
-	}
-	for _, r := range rs.rules {
-		if r.Enabled && r.Phase == phase &&
-			r.Matcher.Matches(req.URL.Scheme, req.URL.Host, req.URL.Path, req.Method) {
-			return true
-		}
-	}
-	return false
-}

@@ -28,7 +28,7 @@ type Action interface {
 // readable; the fields an action does not use are ignored.
 type ActionSpec struct {
 	// Type is the action: set-url, set-query, set-header, remove-header,
-	// set-body, replace-body, set-status, redirect, delay.
+	// set-body, replace-body, set-status, redirect.
 	Type string `json:"type"`
 
 	// Name is the header, query or form field the action targets. Empty means
@@ -45,9 +45,6 @@ type ActionSpec struct {
 	Status int `json:"status,omitempty"`
 	// ContentType sets the body's media type along with Value.
 	ContentType string `json:"contentType,omitempty"`
-
-	// Milliseconds is how long a delay action waits.
-	Milliseconds int `json:"milliseconds,omitempty"`
 }
 
 // compileAction validates a spec and returns the action it describes. The
@@ -99,11 +96,6 @@ func compileAction(spec ActionSpec) (Action, error) {
 			return nil, fmt.Errorf("redirect needs a 3xx status, got %d", spec.Status)
 		}
 		return &redirect{location: spec.Value, status: spec.Status}, nil
-	case "delay":
-		if spec.Milliseconds <= 0 {
-			return nil, fmt.Errorf("delay needs a positive milliseconds")
-		}
-		return &delay{ms: spec.Milliseconds}, nil
 	case "":
 		return nil, fmt.Errorf("action needs a type")
 	}
@@ -197,7 +189,11 @@ func (a *removeHeader) apply(req *msg.Request, resp *msg.Response) (bool, error)
 
 func (a *removeHeader) describe() string { return "remove-header " + a.name }
 
-// setBody replaces a body with text, keeping the content coding.
+// setBody replaces a body with text.
+//
+// The text is encoded with the message's Content-Encoding, so that a client
+// which asked for a compressed response still gets one it can decode: writing
+// plain text under a Content-Encoding header breaks the response.
 type setBody struct{ value, contentType string }
 
 func (a *setBody) apply(req *msg.Request, resp *msg.Response) (bool, error) {
@@ -205,13 +201,15 @@ func (a *setBody) apply(req *msg.Request, resp *msg.Response) (bool, error) {
 	if m == nil {
 		return false, nil
 	}
-	// A request body that is not yet set has no encoding to restore, so the
-	// raw text goes out as it is.
 	if a.contentType != "" {
 		m.SetHeader("Content-Type", a.contentType)
 	}
-	m.SetBody([]byte(a.value))
-	return true, nil
+	if !codecSupported(m.Header.Get("Content-Encoding")) {
+		// An encoding the codec cannot reproduce: drop the header rather than
+		// send bytes that claim to be something they are not.
+		m.Header.Del("Content-Encoding")
+	}
+	return true, setEncodedBody(m, []byte(a.value))
 }
 
 func (a *setBody) describe() string { return "set-body" }
@@ -318,13 +316,6 @@ func (a *redirect) apply(_ *msg.Request, resp *msg.Response) (bool, error) {
 func (a *redirect) describe() string {
 	return fmt.Sprintf("redirect %d %s", a.status, a.location)
 }
-
-// delay waits before the message continues.
-type delay struct{ ms int }
-
-func (a *delay) apply(*msg.Request, *msg.Response) (bool, error) { return true, nil }
-
-func (a *delay) describe() string { return fmt.Sprintf("delay %dms", a.ms) }
 
 // messageOf returns the side an action edits.
 func messageOf(req *msg.Request, resp *msg.Response) *msg.Message {

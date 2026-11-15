@@ -18,7 +18,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"time"
 
@@ -55,6 +54,121 @@ type config struct {
 }
 
 func run() error {
+	cfg := parseFlags()
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(cfg.dataDir, 0o700); err != nil {
+		return err
+	}
+
+	core, err := buildCore(cfg)
+	if err != nil {
+		return err
+	}
+	// The teardown is registered before anything can fail, so that a listener
+	// that fails to start does not leave the other one running.
+	defer core.close()
+
+	core.log()
+	return core.serve(cfg.pprof)
+}
+
+// core is the assembled process: the proxy, the API and what they share.
+type core struct {
+	proxy    *proxy.Proxy
+	server   *api.Server
+	pipeline *pipeline.Pipeline
+	cfg      config
+}
+
+// buildCore assembles the proxy, the rules, the session store and the API.
+func buildCore(cfg config) (*core, error) {
+	ca, err := mitm.LoadOrCreate(cfg.dataDir, "Qingqiuxia Root CA")
+	if err != nil {
+		return nil, err
+	}
+	rules := rule.NewEngine()
+	if err := loadRules(cfg.dataDir, rules); err != nil {
+		return nil, err
+	}
+	sessions := session.NewStore(cfg.sessionLimit)
+	pol := pipeline.New(pipeline.Options{
+		Rules:       rules,
+		Breakpoints: breakpoint.NewManager(0),
+		Sessions:    sessions,
+		Issuer:      mitm.NewIssuer(ca),
+		ShouldIntercept: func(string) bool {
+			return cfg.interceptAll
+		},
+	})
+
+	pr := proxy.New(pol, proxy.Tuning{MaxBodyBytes: cfg.maxBody})
+	if cfg.verbose {
+		pr.SetLogger(log.Default())
+	}
+	if err := pr.Listen(cfg.proxyAddr); err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", cfg.proxyAddr, err)
+	}
+
+	server := api.New(api.Core{
+		Pipeline:  pol,
+		Version:   version,
+		Started:   time.Now(),
+		Addr:      pr.Addr,
+		CaptureOn: pol.Recording,
+		// Capture is the proxy's presence: turning it off stops recording new
+		// sessions while the proxy keeps forwarding.
+		SetCapture: pol.SetRecording,
+		Repeat:     repeater(pr),
+		Logger:     log.Default(),
+	}, api.Options{Token: cfg.token})
+	if err := server.Listen(cfg.apiAddr); err != nil {
+		pr.Close()
+		return nil, fmt.Errorf("listen on %s: %w", cfg.apiAddr, err)
+	}
+	return &core{proxy: pr, server: server, pipeline: pol, cfg: cfg}, nil
+}
+
+// log says where the proxy is and what to install.
+func (c *core) log() {
+	log.Printf("qingqiuxia %s", version)
+	log.Printf("proxy   http://%s  (set this as your HTTP and HTTPS proxy)", c.proxy.Addr())
+	log.Printf("api     http://%s/api/status", c.server.Addr())
+	log.Printf("ca      %s", filepath.Join(c.cfg.dataDir, "ca.crt"))
+	log.Printf("install the CA certificate in your client to see HTTPS traffic")
+}
+
+// serve runs until a signal stops it or a server fails.
+func (c *core) serve(pprofAddr string) error {
+	errs := make(chan error, 3)
+	go func() { errs <- c.proxy.Serve() }()
+	go func() { errs <- c.server.Serve() }()
+	if pprofAddr != "" {
+		go func() { errs <- serveProfiling(pprofAddr) }()
+		log.Printf("pprof   http://%s/debug/pprof/", pprofAddr)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("shutting down")
+		return nil
+	case err := <-errs:
+		return err
+	}
+}
+
+// close stops the servers in the order that leaves no client hanging.
+func (c *core) close() {
+	c.server.Close()
+	c.proxy.Close()
+}
+
+// parseFlags reads the command line.
+func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.proxyAddr, "proxy", "127.0.0.1:8899", "address the proxy listens on")
 	flag.StringVar(&cfg.apiAddr, "api", "127.0.0.1:8898", "address the control API listens on")
@@ -66,90 +180,36 @@ func run() error {
 	flag.BoolVar(&cfg.verbose, "v", false, "log every exchange")
 	flag.StringVar(&cfg.pprof, "pprof", "", "if set, serve pprof and expvar on this address, for profiling the core")
 	flag.Parse()
+	return cfg
+}
 
-	if err := os.MkdirAll(cfg.dataDir, 0o700); err != nil {
-		return err
+// validate rejects a configuration that would silently do the wrong thing.
+func (c config) validate() error {
+	if c.token == "" && !isLoopback(c.apiAddr) {
+		// An API that can read every body and rewrite every request must not
+		// listen on a public address without a token.
+		return fmt.Errorf("the API would listen on %s with no token: pass -token, or bind it to loopback", c.apiAddr)
 	}
+	if c.maxBody <= 0 {
+		return fmt.Errorf("-max-body must be positive")
+	}
+	if c.sessionLimit <= 0 {
+		return fmt.Errorf("-sessions must be positive")
+	}
+	return nil
+}
 
-	ca, err := mitm.LoadOrCreate(cfg.dataDir, "Qingqiuxia Root CA")
+// isLoopback reports whether addr names the local host only.
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		return err
+		host = addr
 	}
-	issuer := mitm.NewIssuer(ca)
-
-	rules := rule.NewEngine()
-	if err := loadRules(cfg.dataDir, rules); err != nil {
-		return err
+	if host == "localhost" {
+		return true
 	}
-	pauses := breakpoint.NewManager(0)
-	sessions := session.NewStore(cfg.sessionLimit)
-
-	pol := pipeline.New(pipeline.Options{
-		Rules:       rules,
-		Breakpoints: pauses,
-		Sessions:    sessions,
-		Issuer:      issuer,
-		ShouldIntercept: func(host string) bool {
-			return cfg.interceptAll
-		},
-	})
-
-	p := proxy.New(pol, proxy.Tuning{MaxBodyBytes: cfg.maxBody})
-	if cfg.verbose {
-		p.SetLogger(log.Default())
-	}
-	if err := p.Listen(cfg.proxyAddr); err != nil {
-		return fmt.Errorf("listen on %s: %w", cfg.proxyAddr, err)
-	}
-
-	core := &api.Core{
-		Pipeline:  pol,
-		Version:   version,
-		Started:   time.Now(),
-		Addr:      p.Addr,
-		CaptureOn: pol.Recording,
-		SetCapture: func(on bool) {
-			// Capture is the proxy's presence: turning it off stops recording
-			// new sessions while the proxy keeps forwarding.
-			pol.SetRecording(on)
-		},
-		Repeat: repeater(p),
-		Logger: log.Default(),
-	}
-	server := api.New(*core, api.Options{Token: cfg.token})
-	if err := server.Listen(cfg.apiAddr); err != nil {
-		return fmt.Errorf("listen on %s: %w", cfg.apiAddr, err)
-	}
-
-	log.Printf("qingqiuxia %s", version)
-	log.Printf("proxy   http://%s  (set this as your HTTP and HTTPS proxy)", p.Addr())
-	log.Printf("api     http://%s/api/status", server.Addr())
-	log.Printf("ca      %s", filepath.Join(cfg.dataDir, "ca.crt"))
-	log.Printf("install the CA certificate in your client to see HTTPS traffic")
-
-	errs := make(chan error, 3)
-	go func() { errs <- p.Serve() }()
-	go func() { errs <- server.Serve() }()
-	if cfg.pprof != "" {
-		go func() { errs <- serveProfiling(cfg.pprof) }()
-		log.Printf("pprof   http://%s/debug/pprof/", cfg.pprof)
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	select {
-	case <-ctx.Done():
-		log.Printf("shutting down")
-	case err := <-errs:
-		if err != nil {
-			p.Close()
-			server.Close()
-			return err
-		}
-	}
-	server.Close()
-	return p.Close()
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // serveProfiling starts the standard library's profiling endpoints, which are
@@ -222,6 +282,3 @@ func loadRules(dir string, e *rule.Engine) error {
 	log.Printf("loaded %d rules from %s", len(specs), path)
 	return nil
 }
-
-var _ = net.JoinHostPort
-var _ = sync.Once{}
