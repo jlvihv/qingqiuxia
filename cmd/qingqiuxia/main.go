@@ -322,7 +322,8 @@ func (c *core) serveWithWindow() error {
 
 	store := qqx.NewStore(c.cfg.sessionLimit)
 	app := qqx.NewApp(store)
-	app.Selected = 0
+	// Nothing is chosen at start-up: the window opens on the traffic list, and
+	// the inspector appears when the user picks a row.
 	app.SetBackend(local, local)
 
 	// 上次的窗口形状和近期流量，在开窗之前恢复：窗口一出来就该是上次的样子，

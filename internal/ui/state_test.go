@@ -170,3 +170,32 @@ func TestAFailedDetailFetchStaysFailed(t *testing.T) {
 		t.Errorf("the backend was asked %d times; a remembered failure must not retry", backend.calls)
 	}
 }
+
+// TestInspectorAppearsOnlyWithASelection checks that the detail panel is not
+// built while nothing is chosen. It used to stand there empty, taking a third of
+// the window's width to say "选一条流量看详情", which the list already implies.
+func TestInspectorAppearsOnlyWithASelection(t *testing.T) {
+	s := NewStore(10)
+	app := NewApp(s)
+	s.Upsert(Session{ID: 1, Method: "GET", URL: "https://x.test/a"})
+	app.Invalidate()
+
+	if app.hasSelection() {
+		t.Error("a fresh window reports a selection")
+	}
+
+	app.Selected = 0
+	app.syncSelectionID(app.Visible())
+	if !app.hasSelection() {
+		t.Error("a chosen row should give the inspector something to show")
+	}
+
+	// Choosing a row and then losing it must not leave the inspector showing a
+	// session that is gone.
+	s.Remove(1)
+	app.Invalidate()
+	app.syncSelectionID(app.Visible())
+	if app.hasSelection() {
+		t.Error("the inspector would show a session the list no longer holds")
+	}
+}

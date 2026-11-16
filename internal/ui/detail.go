@@ -16,16 +16,15 @@ var detailTabs = []string{"概览", "请求", "响应", "说明", "时序"}
 // It is a fixed side panel rather than a second window, because the list stays
 // the thing the user works from, and a row is judged by what the panel says
 // beside it.
+// detail is only built while a row is chosen; content() decides that, so there
+// is no empty state to draw here.
 func (a *App) detail(c *ui.Context, p *Palette) {
+	sess, ok := a.SelectedSession()
+	if !ok {
+		return
+	}
 	ui.Column(c).Fill().Background(p.Surface).Children(func() {
 		a.tabBar(c, p)
-		sess, ok := a.SelectedSession()
-		if !ok {
-			ui.Column(c).Fill().Center().Children(func() {
-				ui.Text(c, "选一条流量看详情").FontSize(tokenFontBody).TextColor(p.Dim)
-			})
-			return
-		}
 		ui.Scroll(c).Fill().Children(func() {
 			ui.Column(c).FillWidth().Padding(tokenSpace4, 14).Gap(0).Children(func() {
 				switch a.Detail {

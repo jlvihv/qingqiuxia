@@ -163,7 +163,7 @@ func NewApp(store *Store) *App {
 		Selected:         -1,
 		Detail:           0,
 		SidebarWidth:     200,
-		MainWidth:        640,
+		MainWidth:        760,
 		Recording:        true,
 		HostsOpen:        true,
 		SidebarSelection: "all",
@@ -792,12 +792,22 @@ var columns = []ui.TableColumn{
 	{Title: "方法", ID: "method", Width: 62},
 	{Title: "状态", ID: "status", Width: 48},
 	{Title: "域名", ID: "host", Width: 128},
-	{Title: "路径", ID: "path", MinWidth: 140},
+	// The path is a column with no natural width, but it is not the one that
+	// takes the room left: a table gives the leftover width to its last column
+	// that shares it, and if that were the path the numbers would be pushed to
+	// the far right of a wide window. So the path has a width a path usually
+	// needs, and the spacer after it is the column that absorbs the rest — the
+	// numbers then sit just past the path, where a reader's eye already is.
+	{Title: "路径", ID: "path", Width: 200, MinWidth: 140},
 	// A numeric column is end-aligned, and a header in a narrow end-aligned
 	// column is clipped at the edge it is aligned to; the titles are short
 	// enough to fit, and the columns are wider than the values they hold.
 	{Title: "大小", ID: "size", Width: 66, Align: ui.End},
 	{Title: "耗时", ID: "time", Width: 68, Align: ui.End},
+	// The spacer: a column with no title and no cells that takes the room the
+	// others leave, so that the table fills its pane without stretching a
+	// column that holds data.
+	{Title: "", ID: "spacer"},
 }
 
 // table draws the sessions, one row per match.
