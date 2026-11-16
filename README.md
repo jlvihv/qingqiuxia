@@ -23,6 +23,10 @@ go build -o qingqiuxia ./cmd/qingqiuxia
 ./qingqiuxia -headless       # 只跑核心，API 在 127.0.0.1:8898
 ```
 
+要发出去的话用 `make release`：去掉符号表和调试信息，23.5 MB 变 16.6 MB，
+并带上版本号（`make release VERSION=1.2.0`）。调试时用 `make build`，崩溃时
+的堆栈才有文件名和行号。
+
 首次启动会在 `~/.config/qingqiuxia/` 生成 CA。让客户端信任它，就能看到 HTTPS 明文：
 
 ```sh
