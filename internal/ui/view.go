@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -17,6 +18,18 @@ type App struct {
 	Filter Filter
 	// Search is the text in the filter box.
 	Search string
+
+	// Section is the sidebar's or the segmented control's choice: which pane the
+	// window shows. SectionTraffic is the traffic list; the others are the rule
+	// list, the breakpoints and the certificate.
+	Section Section
+	// SidebarSelection is the sidebar's own id for what is chosen, which the
+	// framework's Sidebar writes as a string.
+	SidebarSelection string
+	// HostsOpen is whether the sidebar's host section is expanded.
+	HostsOpen bool
+	// ProxyOpen is whether the proxy's popover is showing.
+	ProxyOpen bool
 
 	// Selected is the row the user chose, -1 for none.
 	Selected int
@@ -110,17 +123,49 @@ type Paused struct {
 	URL       string
 }
 
+// Section is one of the window's panes, chosen in the toolbar.
+type Section int
+
+const (
+	// SectionTraffic is the captured traffic, which is what the window is for.
+	SectionTraffic Section = iota
+	// SectionRules is the rules that rewrite traffic.
+	SectionRules
+	// SectionBreakpoints is the breakpoint rules that pause it.
+	SectionBreakpoints
+	// SectionCertificate is the authority certificate to install.
+	SectionCertificate
+)
+
+// String names a section for the segmented control.
+func (s Section) String() string {
+	switch s {
+	case SectionRules:
+		return "规则"
+	case SectionBreakpoints:
+		return "断点"
+	case SectionCertificate:
+		return "证书"
+	}
+	return "流量"
+}
+
+// sections is the toolbar's segmented control, in order.
+var sections = []string{"流量", "规则", "断点", "证书"}
+
 // NewApp returns an app with the window's defaults.
 func NewApp(store *Store) *App {
 	return &App{
-		Store:        store,
-		Selected:     -1,
-		Detail:       0,
-		SidebarWidth: 184,
-		MainWidth:    800,
-		Recording:    true,
-		visibleDirty: true,
-		hostsDirty:   true,
+		Store:            store,
+		Selected:         -1,
+		Detail:           0,
+		SidebarWidth:     200,
+		MainWidth:        640,
+		Recording:        true,
+		HostsOpen:        true,
+		SidebarSelection: "all",
+		visibleDirty:     true,
+		hostsDirty:       true,
 	}
 }
 
@@ -336,107 +381,151 @@ func (a *App) View(c *ui.Context) {
 	})
 }
 
-// toolbar is the top bar: what the core is doing, and the section tabs.
+// toolbar is the window's top bar.
+//
+// It follows the shape a macOS tool window has: the window's own controls on the
+// left, the one thing the pane is about in the middle, and the pane's switch on
+// the right. The traffic list's filter lives here rather than in the list,
+// because a toolbar is where a Mac user looks for a search field; the proxy's
+// port, which changes rarely and takes two controls, is behind a popover so that
+// it does not sit in the toolbar of a window whose proxy is running.
 func (a *App) toolbar(c *ui.Context, p *Palette) {
-	ui.Row(c).FillWidth().Height(tokenHeightToolbar).PaddingX(tokenSpace4).Gap(tokenSpace3).
-		Background(p.Surface).Children(func() {
-		a.recordingDot(c, p)
-		a.portControl(c, p)
-		ca := "未安装"
-		if a.CAInstalled {
-			ca = "已安装"
+	ui.Row(c).FillWidth().Height(tokenHeightToolbar).
+		Padding(tokenSpace2, tokenSpace4, tokenSpace2, tokenContentInset).
+		Gap(tokenSpace4).Background(p.Surface).AlignItems(ui.Center).Children(func() {
+		a.recordingSwitch(c, p)
+		a.proxyButton(c, p)
+		if a.Section == SectionTraffic {
+			a.filterField(c, p)
 		}
-		a.chip(c, p, "CA", ca)
-		ui.Text(c, "流量").TextColor(p.Text).FontSize(tokenFontUI)
-		ui.Text(c, fmt.Sprintf("规则 %d", a.RuleCount)).TextColor(p.TextMuted).FontSize(tokenFontUI)
-		if a.Paused != nil {
-			ui.Text(c, "断点 1").TextColor(p.Danger).FontSize(tokenFontUI)
-		}
+		ui.Row(c).Grow(1).Height(1) // the spacer that pushes the rest right
+		a.sectionControl(c, p)
 	})
 }
 
-// recordingDot says whether the core is capturing, in colour and in words, and
-// turns capture on and off when clicked.
-// recordingDot says what the core is doing, in colour and in words, and turns
-// capture on and off when clicked.
+// recordingSwitch says whether the core is capturing and turns it on or off.
 //
-// The states are three, not two: a proxy that is not listening cannot be
-// recording, so a red light there would say the opposite of what is happening.
-// Nothing toggles when the proxy is off: there is no traffic to record.
-func (a *App) recordingDot(c *ui.Context, p *Palette) {
-	colour := p.Danger
-	label := "录制中"
-	action := "停止录制"
-	reachable := a.down == ""
+// It is a switch rather than a light with words beside it: whether the proxy is
+// recording is a state that is either on or off, and macOS draws that as a
+// switch. A core that is not reachable, or a proxy that is not listening, cannot
+// record, so the switch is disabled and the words say why.
+func (a *App) recordingSwitch(c *ui.Context, p *Palette) {
+	on := a.Recording && a.down == "" && a.ProxyRunning
+	hint := ""
 	switch {
-	case !reachable:
-		// A core that is not reachable must not keep a red light on. The
-		// action names the state rather than a toggle, since there is nothing
-		// to toggle.
-		colour = p.Dim
-		label = "核心未连接"
-		action = "核心未连接"
+	case a.down != "":
+		hint = "核心未连接"
 	case !a.ProxyRunning:
-		colour = p.Dim
-		label = "代理未启动"
-		action = "代理未启动"
-	case !a.Recording:
-		colour = p.Warning
-		label = "未录制"
-		action = "开始录制"
+		hint = "代理未启动"
 	}
-	btn := ui.ButtonBase(c).Label(action)
-	btn.Gap(tokenSpace2).Padding(tokenSpace1, tokenSpace2).Radius(tokenRadiusControl)
-	btn.Children(func() {
-		ui.Row(c).Width(8).Height(8).Radius(4).Background(colour)
-		ui.Text(c, label).Bold().FontSize(tokenFontTitle).TextColor(p.Text)
+
+	ui.Row(c).Gap(tokenSpace2).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "录制").FontSize(tokenFontUI).TextColor(p.TextMuted)
+		// The switch reports the state it was just set to, and the callback is
+		// what changes it: the value is written back from the core's answer on
+		// the next tick, so a failed toggle does not leave a lying switch.
+		wasOn := on
+		sw := ui.Switch(c, &on)
+		sw.Disabled(!a.ProxyRunning || a.down != "")
+		sw.Label("录制流量")
+		if on != wasOn && a.OnToggleCapture != nil {
+			a.OnToggleCapture(on)
+		}
+		// The reason it cannot record goes after the switch in the dimmest text
+		// level: it is an explanation, not a label, and it should read as a note
+		// beside the control rather than as a second title.
+		if hint != "" {
+			ui.Text(c, hint).FontSize(tokenFontMicro).TextColor(p.Dim).SingleLine()
+		}
 	})
-	if btn.Clicked() && reachable && a.ProxyRunning && a.OnToggleCapture != nil {
-		a.OnToggleCapture(!a.Recording)
-	}
 }
 
-// portControl is the proxy's address and its switch.
+// proxyButton shows where the proxy listens, and opens its popover.
 //
-// The proxy is not necessarily running: a window that is only looking at traffic
-// from another source, or one just opened, has nothing listening yet, and the
-// user chooses the port rather than being given one that might be taken. The
-// field is editable while stopped and shows the address while running.
-func (a *App) portControl(c *ui.Context, p *Palette) {
-	ui.Row(c).Height(26).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusControl).
+// The address is the one thing a user copies out of this window — into a browser,
+// a terminal, an app's proxy settings — so it stays in the toolbar in a
+// monospaced face, and only the controls for changing it hide behind the
+// popover.
+func (a *App) proxyButton(c *ui.Context, p *Palette) {
+	open := a.ProxyOpen
+	value := "未启动"
+	colour := p.TextMuted
+	if a.ProxyRunning {
+		value = a.PortAddr
+		colour = p.Success
+	}
+	btn := ui.ButtonBase(c).Label("代理设置")
+	btn.Height(28).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusControl).
 		Background(p.Raised).Children(func() {
+		ui.Icon(c, iconProxy).Width(14).Height(14).TextColor(p.TextMuted)
+		ui.Text(c, value).FontSize(tokenFontBody).Font(monoFamily).
+			TextColor(colour).SingleLine()
+	})
+	// A popover does not open on its own: the button toggles the flag, and the
+	// popover draws while it is set. Clicking it again closes it, which is what a
+	// toolbar button with a popover does.
+	if btn.Clicked() {
+		open = !open
+	}
+	ui.Popover(c, btn, &open, func() {
+		a.proxyPopover(c, p)
+	})
+	a.ProxyOpen = open
+}
+
+// proxyPopover is what the proxy button opens: the port, the switch, and the
+// state of the certificate.
+func (a *App) proxyPopover(c *ui.Context, p *Palette) {
+	ui.Column(c).Width(300).Padding(tokenSpace4).Gap(tokenSpace3).Children(func() {
+		ui.Text(c, "被调试的客户端把代理指向这里").FontSize(tokenFontSmall).TextColor(p.TextMuted)
+
 		if a.ProxyRunning {
-			ui.Text(c, "代理").FontSize(tokenFontBody).TextColor(p.TextMuted)
-			ui.Text(c, a.PortAddr).FontSize(tokenFontBody).Font(monoFamily).
-				TextColor(p.Success).SingleLine()
-			if ui.Button(c, "停止").Clicked() && a.OnStopProxy != nil {
-				a.OnStopProxy()
+			ui.Row(c).Gap(tokenSpace2).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, a.PortAddr).FontSize(tokenFontData).Font(monoFamily).
+					TextColor(p.Success).Grow(1).SingleLine()
+				if ui.Button(c, "停止").Clicked() && a.OnStopProxy != nil {
+					a.OnStopProxy()
+					a.ProxyOpen = false
+				}
+			})
+		} else {
+			input := ui.TextInput(c, &a.PortText).
+				Label("代理端口").Placeholder("端口或地址，留空则随机")
+			// The popover stays open after a click: a port that is taken is
+			// reported right here, and closing on the click would take the reason
+			// away before it was drawn. It closes once the proxy reports that it
+			// is listening, which is the answer the user was waiting for.
+			if input.Submitted() && a.OnStartProxy != nil {
+				a.OnStartProxy(a.PortText)
 			}
-			return
-		}
-		ui.Text(c, "代理").FontSize(tokenFontBody).TextColor(p.TextMuted)
-		input := ui.TextInput(c, &a.PortText).
-			Label("代理端口").Placeholder("端口或地址，留空随机").Width(150)
-		if input.Submitted() && a.OnStartProxy != nil {
-			a.OnStartProxy(a.PortText)
-		}
-		if ui.PrimaryButton(c, "启动").Clicked() && a.OnStartProxy != nil {
-			a.OnStartProxy(a.PortText)
+			if ui.PrimaryButton(c, "启动").Clicked() && a.OnStartProxy != nil {
+				a.OnStartProxy(a.PortText)
+			}
 		}
 		if a.PortError != "" {
-			ui.Text(c, a.PortError).FontSize(tokenFontSmall).
-				TextColor(p.Danger).SingleLine().MaxWidth(220)
+			ui.Text(c, a.PortError).FontSize(tokenFontSmall).TextColor(p.Danger)
 		}
+
+		ui.Divider(c)
+		ui.Row(c).Gap(tokenSpace2).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, iconCert).Width(14).Height(14).TextColor(p.TextMuted)
+			ui.Text(c, "根证书").FontSize(tokenFontBody).TextColor(p.TextMuted)
+			ca, colour := "未安装", p.Warning
+			if a.CAInstalled {
+				ca, colour = "已安装", p.Success
+			}
+			ui.Text(c, ca).FontSize(tokenFontBody).TextColor(colour).Grow(1)
+		})
 	})
 }
 
-// chip is a labelled value in the toolbar, as the proxy's address is.
-func (a *App) chip(c *ui.Context, p *Palette, label, value string) {
-	ui.Row(c).Height(26).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusControl).
-		Background(p.Raised).Border(1, p.Border).Children(func() {
-		ui.Text(c, label).FontSize(tokenFontBody).TextColor(p.TextMuted)
-		ui.Text(c, value).FontSize(tokenFontBody).Font(monoFamily).TextColor(p.Text)
-	})
+// sectionControl switches the window between its panes.
+func (a *App) sectionControl(c *ui.Context, p *Palette) {
+	sel := int(a.Section)
+	ui.Segmented(c, &sel, sections...).Height(28)
+	if sel != int(a.Section) && sel >= 0 && sel < len(sections) {
+		a.Section = Section(sel)
+	}
 }
 
 // pauseBanner appears only while a breakpoint holds a message: a modal would
@@ -459,92 +548,212 @@ func (a *App) pauseBanner(c *ui.Context, p *Palette) {
 	})
 }
 
-// mainArea is the sidebar and the traffic list, side by side.
-func (a *App) mainArea(c *ui.Context, p *Palette) {
-	ui.Split(c, &a.SidebarWidth, func() {
-		a.sidebar(c, p)
-	}, func() {
-		a.trafficList(c, p)
-	}).Fill()
-}
-
-// sidebar lists the sessions, hosts and devices to narrow the traffic by.
+// sidebar is the window's source list.
+//
+// It is the framework's Sidebar rather than a column of buttons: a source list is
+// a thing macOS defines — collapsible sections, a chosen item that is filled
+// rather than outlined, arrow keys, type-to-select, a tree role for assistive
+// technology — and drawing one by hand gets the look and misses everything else.
 func (a *App) sidebar(c *ui.Context, p *Palette) {
-	ui.Column(c).Fill().Background(p.Surface).PaddingY(tokenSpace3).Children(func() {
-		a.sidebarSection(c, p, "会话")
-		a.sidebarItem(c, p, "全部流量", a.Store.Len(), len(a.Filter.Hosts) == 0, func() {
-			a.Filter.Hosts = nil
-			a.Invalidate()
-		})
-		a.sidebarSection(c, p, "域名")
-		for _, h := range a.hosts() {
-			host := h.Host
-			a.sidebarItem(c, p, host, h.Count, a.isHostChosen(host), func() {
-				// Choosing a host narrows the list to it; choosing it again
-				// clears the choice, so one row both filters and unfilters.
-				if a.isHostChosen(host) {
-					a.Filter.Hosts = nil
-				} else {
-					a.Filter.Hosts = []string{host}
+	sel := a.SidebarSelection
+	if sel == "" {
+		sel = "all"
+	}
+	// The traffic is the only thing a source list can filter; the other panes
+	// are lists of their own and bring their sections with them.
+	showTraffic := a.Section == SectionTraffic
+
+	// The source list paints the window's material on macOS, so its fill is
+	// translucent rather than opaque: the sidebar material is behind it, and an
+	// opaque column would hide the one thing that makes a Mac window read as a
+	// Mac window. Elsewhere it composites onto the window's own background.
+	sb := ui.Sidebar(c, &sel, func() {
+		if showTraffic {
+			a.sidebarItem(c, "all", iconAll, "全部流量", a.Store.Len())
+			ui.SidebarSection(c, "域名", &a.HostsOpen, func() {
+				for _, h := range a.hosts() {
+					host := h.Host
+					a.sidebarItem(c, "host:"+host, iconHost, host, h.Count)
 				}
-				a.Invalidate()
 			})
+			return
 		}
+		// The other panes name what they hold, so the list says what is there
+		// instead of showing an empty column beside it.
+		ui.SidebarSection(c, "本页", nil, func() {
+			a.sidebarItem(c, "section", sectionIcon(a.Section), a.Section.String(), a.sectionCount())
+		})
+	})
+	sb.Background(ui.RGBA(0x00, 0x00, 0x00, 0x00))
+
+	a.applySidebarChoice(sel, showTraffic)
+}
+
+// sidebarItem adds one row with its count as a badge.
+//
+// The count is a Badge, which is what a source list puts beside an item: the
+// framework closes the row's children with its own label, and that label already
+// takes the remaining width, so anything added after it has to be a thing that
+// sizes itself — a spacer would take the room the label needed, and the label
+// would be clipped to "api.exa…".
+func (a *App) sidebarItem(c *ui.Context, id string, icon *ui.SVG, label string, count int) {
+	item := ui.SidebarItem(c, id, icon, label)
+	if count > 0 {
+		item.Children(func() {
+			ui.Badge(c, fmt.Sprint(count))
+		})
+	}
+}
+
+// applySidebarChoice turns the source list's choice into a filter.
+func (a *App) applySidebarChoice(sel string, showTraffic bool) {
+	if !showTraffic || sel == a.SidebarSelection {
+		a.SidebarSelection = sel
+		return
+	}
+	previous := a.SidebarSelection
+	a.SidebarSelection = sel
+
+	switch {
+	case sel == "all" || sel == "":
+		a.Filter.Hosts = nil
+	case strings.HasPrefix(sel, "host:"):
+		host := strings.TrimPrefix(sel, "host:")
+		// Choosing the chosen host again clears the filter, so that one row both
+		// narrows the list and widens it.
+		if previous == sel {
+			a.Filter.Hosts = nil
+			return
+		}
+		a.Filter.Hosts = []string{host}
+	default:
+		return
+	}
+	a.Invalidate()
+}
+
+// sectionIcon is the icon a pane's own row shows.
+func sectionIcon(s Section) *ui.SVG {
+	switch s {
+	case SectionRules:
+		return iconRule
+	case SectionBreakpoints:
+		return iconPause
+	case SectionCertificate:
+		return iconCert
+	}
+	return iconAll
+}
+
+// sectionCount is how many things the chosen pane holds.
+func (a *App) sectionCount() int {
+	switch a.Section {
+	case SectionRules:
+		return a.RuleCount
+	case SectionBreakpoints:
+		return a.PausedCount
+	}
+	return 0
+}
+
+// pane draws the chosen section.
+//
+// The traffic list is the window's subject; the other three are panels with their
+// own headers, because a rules table and a certificate are not something a
+// traffic column can show.
+func (a *App) pane(c *ui.Context, p *Palette) {
+	switch a.Section {
+	case SectionRules:
+		a.rulesPane(c, p)
+	case SectionBreakpoints:
+		a.breakpointsPane(c, p)
+	case SectionCertificate:
+		a.certificatePane(c, p)
+	default:
+		a.trafficList(c, p)
+	}
+}
+
+// placeholderPane is the shape the panes that have no table yet take: a heading,
+// what the pane is for, and where to change it from if the window cannot.
+//
+// It is honest about being a placeholder rather than an empty table: a table with
+// no rows says the core has none, which would be a different thing.
+func (a *App) placeholderPane(c *ui.Context, p *Palette, icon *ui.SVG, title, body string) {
+	ui.Column(c).Fill().Background(p.Bg).Padding(tokenSpace5).Gap(tokenSpace3).Children(func() {
+		ui.Row(c).Gap(tokenSpace2).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, icon).Width(16).Height(16).TextColor(p.TextMuted)
+			ui.Text(c, title).Bold().FontSize(tokenFontTitle).TextColor(p.Text)
+		})
+		ui.Text(c, body).FontSize(tokenFontBody).TextColor(p.TextMuted).MaxWidth(460)
 	})
 }
 
-// sidebarSection labels a group of sidebar items.
-func (a *App) sidebarSection(c *ui.Context, p *Palette, title string) {
-	ui.Text(c, title).FontSize(tokenFontLabel).Bold().
-		TextColor(p.Dim).Padding(tokenSpace4, 10, tokenSpace1, 0)
+// rulesPane lists the rules that rewrite traffic.
+func (a *App) rulesPane(c *ui.Context, p *Palette) {
+	a.placeholderPane(c, p, iconRule, "改写规则",
+		fmt.Sprintf("共 %d 条。规则作用于之后进来的流量：请求进来时匹配一次，响应回来时再匹配一次。"+
+			"在窗口里编辑规则还没有做完；现在用 /api/rules 增删改，改完这里会跟着变。", a.RuleCount))
 }
 
-// sidebarItem is one clickable row in the sidebar. The label names it for a
-// screen reader and for a test; onPress runs when the row is chosen.
-func (a *App) sidebarItem(c *ui.Context, p *Palette, label string, count int, active bool, onPress func()) {
-	btn := ui.ButtonBase(c).Label(label)
-	e := btn.FillWidth().Height(tokenHeightRow).PaddingX(tokenSpace4).Gap(tokenSpace3)
-	if active {
-		e.Background(p.Hover)
+// breakpointsPane lists the breakpoint rules, and what is waiting at them.
+func (a *App) breakpointsPane(c *ui.Context, p *Palette) {
+	a.placeholderPane(c, p, iconPause, "断点",
+		fmt.Sprintf("现在有 %d 条消息停在断点上。断点会暂停流量等人决定，"+
+			"和自动生效的规则不是一回事；暂停的横幅在列表上方，放行和中止在那里。", a.PausedCount))
+}
+
+// certificatePane shows the certificate to install on the device being debugged.
+func (a *App) certificatePane(c *ui.Context, p *Palette) {
+	state := "未安装"
+	colour := p.Warning
+	if a.CAInstalled {
+		state, colour = "已安装", p.Success
 	}
-	e.Children(func() {
-		colour := p.TextMuted
-		if active {
-			colour = p.Text
-		}
-		ui.Text(c, label).FontSize(tokenFontUI).SingleLine().TextColor(colour)
-		ui.Row(c).Grow(1)
-		ui.Text(c, fmt.Sprint(count)).FontSize(tokenFontSmall).Font(monoFamily).TextColor(p.Dim)
+	ui.Column(c).Fill().Background(p.Bg).Padding(tokenSpace5).Gap(tokenSpace3).Children(func() {
+		ui.Row(c).Gap(tokenSpace2).AlignItems(ui.Center).Children(func() {
+			ui.Icon(c, iconCert).Width(16).Height(16).TextColor(p.TextMuted)
+			ui.Text(c, "根证书").Bold().FontSize(tokenFontTitle).TextColor(p.Text)
+			ui.Text(c, state).FontSize(tokenFontBody).TextColor(colour)
+		})
+		ui.Text(c, "要让 HTTPS 被解开，被调试的设备必须信任这个根证书。"+
+			"下载后装进系统信任库，或者让 curl 用 --cacert 指过来。").
+			FontSize(tokenFontBody).TextColor(p.TextMuted).MaxWidth(460)
+		ui.Text(c, "curl -O http://127.0.0.1:8898/api/certificate?download=1").
+			FontSize(tokenFontData).Font(monoFamily).TextColor(p.Text)
 	})
-	if btn.Clicked() && onPress != nil {
-		onPress()
-	}
 }
 
 // trafficList is the table of sessions, and the window's main subject.
 func (a *App) trafficList(c *ui.Context, p *Palette) {
 	ui.Column(c).Fill().Background(p.Bg).Children(func() {
-		a.filterBar(c, p)
 		a.table(c, p)
 	})
 }
 
-// filterBar is where the user narrows the list.
-func (a *App) filterBar(c *ui.Context, p *Palette) {
-	ui.Row(c).FillWidth().Height(tokenHeightBar).PaddingX(tokenSpace3).Gap(tokenSpace3).
-		Background(p.Surface).Children(func() {
-		// The label names the box for a screen reader and for a test that
-		// clicks it; the placeholder is only a hint about what it accepts.
+// filterField is the toolbar's filter box.
+//
+// It is in the toolbar rather than above the list because that is where a Mac
+// user looks for a search field, and because it is the one control that narrows
+// whatever the window is showing. The count beside it is what tells the user the
+// filter did something.
+func (a *App) filterField(c *ui.Context, p *Palette) {
+	ui.Row(c).AlignItems(ui.Center).Gap(tokenSpace2).Children(func() {
+		ui.Icon(c, iconFilter).Width(13).Height(13).TextColor(p.Dim)
+		// The label names the box for a screen reader and for a test that clicks
+		// it; the placeholder is only a hint about what it accepts.
 		input := ui.TextInput(c, &a.Search).
-			Label("过滤").Placeholder("过滤 URL、方法或状态码").Grow(1)
+			Label("过滤").Placeholder("过滤 URL、方法或状态码").Width(260)
 		if input.Changed() {
-			// The typed text narrows the list as it is typed; the table below
-			// is built after this, so it shows the new filter in this frame.
+			// The typed text narrows the list as it is typed; the table is built
+			// after this, so it shows the new filter in this frame.
 			a.Filter.Text = a.Search
 			a.Invalidate()
 		}
-		ui.Text(c, fmt.Sprintf("%d 条", len(a.Visible()))).FontSize(tokenFontData).
-			Font(monoFamily).TextColor(p.Dim)
+		if a.Search != "" {
+			ui.Text(c, fmt.Sprintf("%d 条", len(a.Visible()))).FontSize(tokenFontSmall).
+				Font(monoFamily).TextColor(p.Dim).SingleLine()
+		}
 	})
 }
 

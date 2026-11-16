@@ -44,9 +44,18 @@ const (
 	// Spacing steps, in DIPs. The window uses these and nothing in between.
 	tokenSpace1 float32 = 4
 	tokenSpace2 float32 = 6
-	tokenSpace3 float32 = 8
-	tokenSpace4 float32 = 12
-	tokenSpace5 float32 = 16
+	tokenSpace3 float32 = 10
+	tokenSpace4 float32 = 14
+	tokenSpace5 float32 = 20
+
+	// tokenTrafficLightInset is how far the window's close button sits from the
+	// window's left edge when the title bar is hidden, and tokenContentInset the
+	// room the sidebar leaves for it: macOS puts the traffic lights inside the
+	// content, so the first row of a sidebar starts below and to the right of
+	// them. The value is what TitleBarHiddenInset uses by default, plus a little
+	// so that a sidebar item's own padding lines up with the buttons.
+	tokenTrafficLightInset float32 = 20
+	tokenContentInset      float32 = 46
 
 	// Type sizes. Data is always monospaced, chrome never is.
 	tokenFontMicro float32 = 9.5  // a badge
@@ -58,16 +67,26 @@ const (
 	tokenFontTitle float32 = 13
 
 	// Row and bar heights, so that a list and a panel line up.
-	tokenHeightToolbar float32 = 44
-	tokenHeightBar     float32 = 34
-	tokenHeightStatus  float32 = 24
-	tokenHeightRow     float32 = 24
+	//
+	// The row is 28, not 24: a capture tool's rows carry five columns of data and
+	// a badge, and at 24 the status code and the duration touch each other at the
+	// sizes macOS draws. 28 is what Finder's list and Proxyman's table use.
+	tokenHeightToolbar float32 = 52 // macOS unified toolbars are 52 with a hidden title bar
+	tokenHeightBar     float32 = 36
+	tokenHeightStatus  float32 = 26
+	tokenHeightRow     float32 = 28
 )
 
 // monoFamily is the monospaced family every datum uses, without exception: it
 // is what keeps digits aligned down a column, so that an anomalous duration is
 // visible while scanning rather than on inspection.
-const monoFamily = "monospace"
+//
+// It names the system's own faces rather than the generic "monospace": that
+// keyword resolves to Courier on macOS, which is both ugly and wider than the
+// data columns were measured for. SF Mono ships with macOS, Menlo with every Mac,
+// and the rest cover the other two platforms; the generic family is last so a
+// machine without any of them still gets a monospaced fallback.
+const monoFamily = "SF Mono, SFMono-Regular, Menlo, Consolas, DejaVu Sans Mono, monospace"
 
 // Palette is the interface's colours, resolved from the tokens once.
 //

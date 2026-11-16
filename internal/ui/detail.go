@@ -51,26 +51,41 @@ func (a *App) detail(c *ui.Context, p *Palette) {
 // colour, and a dim line under a chosen tab reads as a disabled one.
 func (a *App) tabBar(c *ui.Context, p *Palette) {
 	tabs := ui.TabsBase(c, &a.Detail, len(detailTabs))
-	ui.Row(c).FillWidth().Padding(tokenSpace3, tokenSpace3, 0, 0).
+	ui.Row(c).FillWidth().Padding(tokenSpace3, tokenSpace4, 0, 0).
 		Border(0, p.Border).Children(func() {
-		tabs.List.Gap(tokenSpace1).Children(func() {
+		tabs.List.Gap(tokenSpace4).Children(func() {
 			for i, label := range detailTabs {
-				tab := tabs.Tab(i).Padding(tokenSpace2, tokenSpace3)
 				on := i == a.Detail
-				if on {
-					tab.Border(0, p.Accent)
-				}
-				tab.Children(func() {
-					e := ui.Text(c, label).FontSize(tokenFontBody)
+				tab := tabs.Tab(i)
+				// The tab is a column: the label, then an underline of its own
+				// width. Every tab draws the bar, transparent when it is not the
+				// chosen one, so that choosing a tab does not shift the strip.
+				tab.Gap(tokenSpace1).Padding(tokenSpace2, 0, 0, 0).Shrink(0).Children(func() {
+					e := ui.Text(c, label).FontSize(tokenFontSmall).SingleLine()
 					if on {
 						e.TextColor(p.Text).Bold()
 					} else {
 						e.TextColor(p.TextMuted)
 					}
+					bar := p.Accent
+					if !on {
+						bar = ui.RGBA(0, 0, 0, 0)
+					}
+					ui.Row(c).Height(2).Radius(1).Width(underlineWidth(label)).Background(bar)
 				})
 			}
 		})
 	})
+}
+
+// underlineWidth is how wide a tab's underline is.
+//
+// A CJK glyph is about one em wide at this size, so a rune count times the font
+// size overstates it: the bar that came out was half again as wide as the word
+// above it. 0.72 of an em is what a bold CJK label measures, which makes the rule
+// sit under its word rather than past it.
+func underlineWidth(label string) float32 {
+	return float32(len([]rune(label))) * tokenFontSmall * 0.72
 }
 
 // urlBar is the request line, which every pane starts with: the one thing a

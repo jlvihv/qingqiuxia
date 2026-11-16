@@ -25,6 +25,9 @@ func (a *App) SetProxyRunning(addr string) {
 	a.PortAddr = addr
 	a.ProxyAddr = addr
 	a.PortError = ""
+	// The proxy's popover was open to choose the port, and the port is now
+	// chosen: nothing left in it to read.
+	a.ProxyOpen = false
 }
 
 // SetProxyStopped records that nothing is listening: the port field goes back

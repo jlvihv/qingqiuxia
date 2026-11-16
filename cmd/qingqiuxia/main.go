@@ -412,12 +412,27 @@ func (c *core) serveWithWindow() error {
 		if saved.Width > 400 && saved.Height > 300 {
 			w, h = saved.Width, saved.Height
 		}
-		win = mygo.NewWindow(mygo.WindowOptions{
-			Title:   "请求侠",
-			Width:   int(w),
-			Height:  int(h),
-			Content: ui.View(app.View),
-		})
+		opts := mygo.WindowOptions{
+			Title:     "请求侠",
+			Width:     int(w),
+			Height:    int(h),
+			MinWidth:  900,
+			MinHeight: 560,
+			// The window remembers its own place, size and maximized state, which
+			// is what the saved shape was for. It also remembers which display it
+			// was on, which a width and a height cannot.
+			StateKey: "main",
+			Content:  ui.View(app.View),
+		}
+		if runtime.GOOS == "darwin" {
+			// macOS: no title bar of its own, so the traffic lights sit inside
+			// the toolbar and the sidebar gets the window's material, the way
+			// every tool window on the platform works.
+			opts.TitleBarStyle = mygo.TitleBarHiddenInset
+			opts.TrafficLightPosition = &mygo.Point{X: 20, Y: 20}
+			opts.Vibrancy = mygo.VibrancySidebar
+		}
+		win = mygo.NewWindow(opts)
 	})
 	go func() {
 		sig := make(chan os.Signal, 1)

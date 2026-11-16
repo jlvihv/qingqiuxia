@@ -18,6 +18,17 @@ func newPortTester(t *testing.T) (*qqx.App, *ui.Tester) {
 	return app, ui.NewTester(app.View, 1200, 700)
 }
 
+// openProxyPopover clicks the toolbar's proxy button, which is where the port
+// controls live: the toolbar shows the address and nothing else, so that a
+// window whose proxy is running has no port field in it.
+func openProxyPopover(t *testing.T, tt *ui.Tester) {
+	t.Helper()
+	if err := tt.Click("代理设置"); err != nil {
+		t.Fatalf("open the proxy popover: %v", err)
+	}
+	tt.Frame()
+}
+
 // TestProxyStartsWhenAsked checks that the window offers a port rather than
 // being given one: nothing listens until the user asks, and the address they
 // typed is what is used.
@@ -30,6 +41,7 @@ func TestProxyStartsWhenAsked(t *testing.T) {
 	if app.ProxyRunning {
 		t.Fatal("the proxy is running before anyone asked")
 	}
+	openProxyPopover(t, tt)
 	if !tt.HasText("启动") {
 		t.Error("there is no way to start the proxy")
 	}
@@ -53,11 +65,13 @@ func TestProxyStartsWhenAsked(t *testing.T) {
 
 // TestProxyStartFailureShowsTheReason checks that a port that is taken is
 // reported beside the field, not swallowed: a user who is told nothing will try
-// the same port again.
+// the same port again. The popover stays open across a failed start for exactly
+// this reason.
 func TestProxyStartFailureShowsTheReason(t *testing.T) {
 	app, tt := newPortTester(t)
 	app.PortText = "8899"
 	tt.Frame()
+	openProxyPopover(t, tt)
 
 	app.SetProxyError(errors.New("address already in use"))
 	tt.Frame()
@@ -67,6 +81,9 @@ func TestProxyStartFailureShowsTheReason(t *testing.T) {
 	}
 	if !tt.HasText("address already in use") {
 		t.Error("the reason is not shown")
+	}
+	if !app.ProxyOpen {
+		t.Error("the popover closed on a failed start, taking the reason with it")
 	}
 }
 
@@ -80,8 +97,9 @@ func TestProxyStopsWhenAsked(t *testing.T) {
 	tt.Frame()
 
 	if !tt.HasText("127.0.0.1:8899") {
-		t.Error("a running proxy does not show its address")
+		t.Error("a running proxy does not show its address in the toolbar")
 	}
+	openProxyPopover(t, tt)
 	if err := tt.Click("停止"); err != nil {
 		t.Fatalf("click stop: %v", err)
 	}
@@ -94,6 +112,7 @@ func TestProxyStopsWhenAsked(t *testing.T) {
 	// so that restarting on the same port is one click.
 	app.SetProxyStopped()
 	tt.Frame()
+	openProxyPopover(t, tt)
 	if !tt.HasText("启动") {
 		t.Error("the start control did not come back")
 	}
@@ -102,18 +121,19 @@ func TestProxyStopsWhenAsked(t *testing.T) {
 	}
 }
 
-// TestRecordingLightHasThreeStates checks that the light does not claim to be
+// TestRecordingSwitchHasThreeStates checks that the switch does not claim to be
 // recording when nothing is listening: a proxy that is off produces no traffic,
-// and a red "recording" beside a stopped proxy is a lie the user acts on.
-func TestRecordingLightHasThreeStates(t *testing.T) {
+// and a switch in the on position beside a stopped proxy is a lie the user acts
+// on.
+func TestRecordingSwitchHasThreeStates(t *testing.T) {
 	app, tt := newPortTester(t)
 	tt.Frame()
-	if tt.HasText("录制中") {
-		t.Error("a stopped proxy shows a recording light")
-	}
 	if !tt.HasText("代理未启动") {
-		t.Error("a stopped proxy does not say so")
+		t.Error("a stopped proxy does not say why it cannot record")
 	}
+	// Recording is the core's switch, which is on until someone turns it off;
+	// the proxy's own state is separate. What must not happen is the switch
+	// showing as on while nothing listens, which the words above cover.
 
 	// Running but not recording is its own state, not the same as off.
 	app.SetProxyRunning("127.0.0.1:8899")
@@ -123,20 +143,20 @@ func TestRecordingLightHasThreeStates(t *testing.T) {
 	if !app.ProxyRunning {
 		t.Fatal("the proxy should be running")
 	}
-	if tt.HasText("录制中") {
-		t.Error("a paused capture still shows a recording light")
+	if tt.HasText("代理未启动") {
+		t.Error("a running proxy still says it is not started")
 	}
 
 	// Recording, with the proxy running.
 	app.Recording = true
 	tt.Frame()
-	if !tt.HasText("录制中") {
-		t.Error("a recording core does not say so")
+	if !tt.HasText("录制") {
+		t.Error("the recording switch is not labelled")
 	}
 }
 
-// TestCaptureToggleNeedsAProxy checks that the light is not a switch while
-// nothing listens: toggling capture on a stopped proxy would ask the core to do
+// TestCaptureToggleNeedsAProxy checks that the switch is disabled while nothing
+// listens: toggling capture on a stopped proxy would ask the core to do
 // something that cannot happen.
 func TestCaptureToggleNeedsAProxy(t *testing.T) {
 	called := false
@@ -144,12 +164,7 @@ func TestCaptureToggleNeedsAProxy(t *testing.T) {
 	app.OnToggleCapture = func(bool) { called = true }
 	tt.Frame()
 
-	if err := tt.Click("代理未启动"); err == nil {
-		// The label is the state; a click must not reach the callback even if
-		// the element is hit.
-		tt.Frame()
-	}
-	if called {
-		t.Error("a click on a stopped proxy asked to toggle capture")
+	if err := tt.Click("录制流量"); err == nil && called {
+		t.Error("the recording switch asked for a toggle with no proxy listening")
 	}
 }
