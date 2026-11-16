@@ -131,10 +131,10 @@ curl -s 'localhost:8898/api/sessions?limit=200'
 | GET | `/api/events` | SSE：`session` / `dropped` / `paused` / `resumed` |
 | POST | `/api/sessions/{id}/repeat` | 重放，body 可带 `count` `delay` `interval` |
 | GET/POST | `/api/rules` | 列出 / 新增规则 |
-| PUT | `/api/rules` | 整体替换（用于排序） |
+| GET | `/api/rules/{id}` | 单条规则，改一个字段再 PUT 回去 |
+| PUT | `/api/rules` | 整体替换；数组顺序就是匹配顺序 |
 | PATCH | `/api/rules/{id}` | 启停：`{"enabled":false}` |
 | DELETE | `/api/rules/{id}` | 删除 |
-| GET | `/api/rules` | 规则列表 |
 | GET/PUT | `/api/breakpoints` | 断点规则 |
 | GET | `/api/pauses` | 当前暂停的消息 |
 | PUT | `/api/pauses/{id}` | 编辑暂停的消息：`side` `headers` `body` `status` |
@@ -209,8 +209,11 @@ go test ./internal/proxy -bench . -run XXX   # 基准
 
 - TLS 拦截目前只对客户端说 HTTP/1.1：隧道里跑的是一个 `http.Server`，不协商 h2。对源站可以用 h2。
 - 上游证书默认不校验（和 Charles/mitmproxy 一样），因为要调的就是自签和过期证书的服务。
-- body 超过 `-max-body` 的部分不保留：会照常转发给源站，但会话里只有开头一段，并标记 `truncated`。
-- WebSocket 目前走透传，不解帧。
+- body 超过 `-max-body` 的部分**会话里不保留**，但照常转发：请求体和响应体都是如此，
+  客户端和源站看到的仍是完整的 body。会话里存开头一段并标记 `truncated`，超过上限的那部分
+  以流的形式直接透传，不缓冲、不重写。
+- WebSocket（以及任何 `Connection: Upgrade`）握手按普通会话记录，101 之后双向透传，不解帧：
+  帧协议不在本工具解析范围内，抓到的记录是握手本身。
 
 ## 一个进程，直接调用
 

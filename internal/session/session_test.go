@@ -132,3 +132,33 @@ func TestHubSlowSubscriberDoesNotBlock(t *testing.T) {
 		t.Errorf("got %d, want the newest 99", got)
 	}
 }
+
+// TestSnapshotDoesNotWriteThrough checks the other direction of a snapshot's
+// isolation. TestSnapshotIsImmutable above checks that editing the live request
+// does not change a snapshot; this checks that editing a snapshot does not change
+// the store, which the earlier test could not see.
+func TestSnapshotDoesNotWriteThrough(t *testing.T) {
+	s := NewStore(10)
+	req := newRequest(t, "https://x.test/")
+	req.Body = []byte("original")
+	sess := s.Begin(req, time.Now())
+	sess.Complete(&msg.Response{Status: 200, Body: []byte("resp")}, nil, time.Now())
+
+	snap, ok := s.Get(sess.ID)
+	if !ok {
+		t.Fatal("no session")
+	}
+	snap.Request.Header.Set("X-New", "1")
+	snap.Response.Body[0] = 'X'
+
+	again, ok := s.Get(sess.ID)
+	if !ok {
+		t.Fatal("no session")
+	}
+	if got := again.Request.Header.Get("X-New"); got != "" {
+		t.Errorf("a snapshot wrote header %q into the store", got)
+	}
+	if got := string(again.Response.Body); got != "resp" {
+		t.Errorf("a snapshot wrote body %q into the store", got)
+	}
+}

@@ -4,7 +4,6 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
-	"time"
 
 	"github.com/jlvihv/qingqiuxia/internal/msg"
 )
@@ -38,5 +37,3 @@ func mustGet(t *testing.T, ts *testServer, path string) any {
 	}
 	return out
 }
-
-var _ = time.Now

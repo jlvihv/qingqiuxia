@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/egoist/mygo/ui"
@@ -210,15 +211,22 @@ func (a *App) messagePane(c *ui.Context, p *Palette, sess *Session, side string)
 // first shows it.
 //
 // It asks once per session: a frame runs many times a second, and a request per
-// frame would be a request per frame. A failure is kept too, so a session the
-// core has already dropped does not retry on every frame.
+// frame would be a request per frame. A failure is remembered too — a session the
+// core has already dropped should not be retried every frame — but it is
+// remembered as a failure. Returning nil for it on later frames made the pane say
+// a session had no content, when what had happened is that its body was never
+// read.
 func (a *App) bodiesFor(id uint64) (Detail, error) {
 	if a.detailID == id {
+		if a.detailErr != "" {
+			return Detail{}, errors.New(a.detailErr)
+		}
 		return a.bodies, nil
 	}
 	a.detailID = id
 	a.detailKey = id
 	a.bodies = Detail{}
+	a.detailErr = ""
 	if a.backend == nil {
 		return Detail{}, nil
 	}
@@ -227,7 +235,6 @@ func (a *App) bodiesFor(id uint64) (Detail, error) {
 		a.detailErr = err.Error()
 		return Detail{}, err
 	}
-	a.detailErr = ""
 	a.bodies = d
 	return d, nil
 }

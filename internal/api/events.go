@@ -76,7 +76,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if err := writeEvent(w, pauseEventName(ev.Kind), toPausedJSON(ev.Paused)); err != nil {
+			if err := writeEvent(w, pauseEventName(ev.Kind), toPausedJSON(ev.Paused.Snapshot())); err != nil {
 				return
 			}
 			flusher.Flush()
@@ -102,7 +102,11 @@ func pauseEventName(k breakpoint.EventKind) string {
 }
 
 // toPausedJSON describes a pause for the stream.
-func toPausedJSON(p *breakpoint.Paused) pausedJSON {
+//
+// The message is read from a snapshot: the live pause's request is the one a
+// person edits through PUT /api/pauses/{id}, and marshalling it directly raced
+// with that edit.
+func toPausedJSON(p breakpoint.Snapshot) pausedJSON {
 	v := pausedJSON{
 		ID:        p.ID,
 		SessionID: p.SessionID,

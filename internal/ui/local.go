@@ -95,9 +95,19 @@ func (l *Local) Status(context.Context) (Status, error) {
 }
 
 // Sessions returns the traffic, newest first.
+//
+// A limit asks for the newest rows, not the first ones: List pages from the
+// oldest end, so a limit of three out of ten used to return the three that
+// arrived first — the opposite of what a live list wants.
 func (l *Local) Sessions(_ context.Context, limit int) ([]Session, int, uint64, error) {
 	store := l.Pipeline.Sessions()
-	list := store.List(0, limit)
+	offset := 0
+	if limit > 0 {
+		if n := store.Len(); n > limit {
+			offset = n - limit
+		}
+	}
+	list := store.List(offset, limit)
 	out := make([]Session, 0, len(list))
 	// The store lists oldest first; the window shows newest first.
 	for i := len(list) - 1; i >= 0; i-- {

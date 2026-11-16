@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,11 @@ const (
 var ErrTimeout = errors.New("breakpoint: timed out waiting for a decision")
 
 // Paused is one message waiting for a decision.
+//
+// Its request and response are the live ones the proxy will continue with, which
+// a client of the control API edits. Everything that reads them from outside —
+// the API's list, the event stream, the window — goes through Snapshot, so that
+// a reader never holds the object a person is editing.
 type Paused struct {
 	// ID identifies the pause in the API.
 	ID uint64
@@ -77,17 +83,44 @@ type Paused struct {
 	Phase Phase
 	// RuleName is the breakpoint rule that matched.
 	RuleName string
+	// At is when it stopped.
+	At time.Time
+
+	// mu guards the message and its edits. The proxy reads the message once,
+	// after the decision, so the lock is only ever held for an edit or a copy.
+	mu sync.Mutex
 	// Request is the request as it stands; for a response breakpoint it is the
 	// request the response belongs to.
 	Request *msg.Request
 	// Response is set for a response breakpoint.
 	Response *msg.Response
-	// At is when it stopped.
-	At time.Time
 
 	// decided wakes the waiting proxy goroutine exactly once.
 	decideOnce sync.Once
 	decision   chan Decision
+}
+
+// Snapshot copies the paused message, so a caller can read it while the proxy
+// carries on and a person edits it.
+func (p *Paused) Snapshot() Snapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return Snapshot{
+		ID: p.ID, SessionID: p.SessionID, Phase: p.Phase, RuleName: p.RuleName, At: p.At,
+		Request: p.Request.Clone(), Response: p.Response.Clone(),
+	}
+}
+
+// Edit applies an edit to the paused message under the pause's lock, so an edit
+// and a snapshot cannot interleave. It reports whether there was anything to
+// edit.
+func (p *Paused) Edit(fn func(req *msg.Request, resp *msg.Response) error) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.Request == nil && p.Response == nil {
+		return fmt.Errorf("breakpoint: the pause holds no message")
+	}
+	return fn(p.Request, p.Response)
 }
 
 // Send decides what happens to the paused message. It returns false when the
@@ -101,23 +134,35 @@ func (p *Paused) Send(d Decision) bool {
 	return sent
 }
 
+// Snapshot is a paused message as a reader sees it, copied out of the live one.
+type Snapshot struct {
+	ID        uint64
+	SessionID uint64
+	Phase     Phase
+	RuleName  string
+	Request   *msg.Request
+	Response  *msg.Response
+	At        time.Time
+}
+
 // Manager holds the breakpoint rules and the paused messages.
 type Manager struct {
 	rules atomic.Pointer[[]*breakpointRule]
 	mu    sync.Mutex // guards the maps below
-	// byID indexes pauses by their own ID.
+	// byID indexes pauses by their own ID, which is what the API names them by.
 	byID map[uint64]*Paused
-	// bySession indexes pauses by the session they belong to, so the API can
-	// find the pause for a row the user clicked.
-	bySession map[uint64]*Paused
-	next      uint64
-	hub       *events.Hub[Event]
+	next uint64
+	hub  *events.Hub[Event]
 	// timeout bounds how long a message may wait, so a forgotten breakpoint
 	// cannot hang a client for ever.
 	timeout time.Duration
 }
 
 // Event is a pause or resume, published for the API's live view.
+//
+// Paused carries the live pause, whose message must be read through Snapshot: a
+// subscriber that marshalled it directly would be reading the object a person
+// edits.
 type Event struct {
 	Kind   EventKind
 	Paused *Paused
@@ -140,10 +185,9 @@ func NewManager(timeout time.Duration) *Manager {
 		timeout = DefaultTimeout
 	}
 	m := &Manager{
-		byID:      make(map[uint64]*Paused, 8),
-		bySession: make(map[uint64]*Paused, 8),
-		hub:       events.New[Event](64),
-		timeout:   timeout,
+		byID:    make(map[uint64]*Paused, 8),
+		hub:     events.New[Event](64),
+		timeout: timeout,
 	}
 	empty := []*breakpointRule(nil)
 	m.rules.Store(&empty)
@@ -152,6 +196,11 @@ func NewManager(timeout time.Duration) *Manager {
 
 // DefaultTimeout is how long a paused message waits for a decision.
 const DefaultTimeout = 5 * time.Minute
+
+// StatusForAbort is the status a client gets when a paused message is refused.
+// It is the policy's decision to make, not the proxy's: an abort is what a
+// person chose for traffic they were inspecting.
+const StatusForAbort = 403
 
 // Hub exposes the manager's pause and resume stream.
 func (m *Manager) Hub() *events.Hub[Event] { return m.hub }
@@ -205,10 +254,12 @@ func compile(spec Spec, id uint64) (*breakpointRule, error) {
 
 // Replace swaps the whole breakpoint rule set.
 func (m *Manager) Replace(specs []Spec) error {
+	// The IDs are handed out and the counter advanced under one hold of the
+	// lock: reading the counter, releasing it to compile, and writing it back
+	// was a lost update whenever a pause started meanwhile, and a pause that
+	// reused a live ID made Resume decide the wrong message.
 	m.mu.Lock()
 	next := m.next
-	m.mu.Unlock()
-
 	rules := make([]*breakpointRule, 0, len(specs))
 	seen := make(map[uint64]bool, len(specs))
 	for _, spec := range specs {
@@ -220,19 +271,22 @@ func (m *Manager) Replace(specs []Spec) error {
 			next = id
 		}
 		if seen[id] {
+			m.mu.Unlock()
 			return fmt.Errorf("breakpoint: duplicate id %d", id)
 		}
 		seen[id] = true
 		r, err := compile(spec, id)
 		if err != nil {
+			m.mu.Unlock()
 			return err
 		}
 		rules = append(rules, r)
 	}
-
-	m.mu.Lock()
 	m.next = next
 	m.mu.Unlock()
+
+	// Compiling under the lock is fine: a spec list is small, and the lock is
+	// not on the hot path — Intercept reads the atomic pointer.
 	m.rules.Store(&rules)
 	return nil
 }
@@ -253,21 +307,47 @@ func (m *Manager) Rules() []Spec {
 }
 
 // Pending returns the messages waiting for a decision, oldest first.
-func (m *Manager) Pending() []*Paused {
+//
+// The pauses are copied out: a list is read while a person edits the message a
+// pause holds, and handing out the live one is a race with that edit.
+func (m *Manager) Pending() []Snapshot {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	out := make([]*Paused, 0, len(m.byID))
 	for _, p := range m.byID {
 		out = append(out, p)
 	}
-	// The map has no order, so sort by pause ID, which is the order they
-	// stopped in.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1].ID > out[j].ID; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
+	m.mu.Unlock()
+	// The map has no order, so sort by pause ID, which is the order they stopped
+	// in. The lock is released first: a copy takes the pause's own lock, and
+	// holding the manager's while doing it would put an edit behind the list.
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+
+	snaps := make([]Snapshot, 0, len(out))
+	for _, p := range out {
+		snaps = append(snaps, p.Snapshot())
 	}
-	return out
+	return snaps
+}
+
+// PendingByID returns a copy of one pause, for a client that has its ID.
+func (m *Manager) PendingByID(id uint64) (Snapshot, bool) {
+	m.mu.Lock()
+	p, ok := m.byID[id]
+	m.mu.Unlock()
+	if !ok {
+		return Snapshot{}, false
+	}
+	return p.Snapshot(), true
+}
+
+// Live returns the pause itself, for a caller that has to edit the message the
+// proxy will continue with. Everything that only reads must use Snapshot or
+// Pending, which copy.
+func (m *Manager) Live(id uint64) (*Paused, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.byID[id]
+	return p, ok
 }
 
 // match returns the first breakpoint rule that applies, or nil.
@@ -315,7 +395,6 @@ func (m *Manager) Intercept(ctx context.Context, sessionID uint64, phase Phase, 
 		decision:  make(chan Decision, 1),
 	}
 	m.byID[p.ID] = p
-	m.bySession[sessionID] = p
 	m.mu.Unlock()
 
 	m.hub.Publish(Event{Kind: EventPaused, Paused: p})
@@ -333,19 +412,24 @@ func (m *Manager) Intercept(ctx context.Context, sessionID uint64, phase Phase, 
 		m.resolve(p)
 		return Intercept{}, ctx.Err()
 	}
+	// The decision has been made, so the client can no longer edit; the message
+	// the proxy continues with is the one a client may have edited up to now,
+	// read under the pause's lock so an edit cannot be half-applied.
 	m.resolve(p)
 
 	if d == Abort {
-		return Intercept{Matched: true, Abort: true, Status: 403}, nil
+		return Intercept{Matched: true, Abort: true, Status: StatusForAbort}, nil
 	}
-	return Intercept{Matched: true, Request: p.Request, Response: p.Response}, nil
+	p.mu.Lock()
+	edited, editedResp := p.Request, p.Response
+	p.mu.Unlock()
+	return Intercept{Matched: true, Request: edited, Response: editedResp}, nil
 }
 
 // resolve removes a pause from the maps and publishes its end.
 func (m *Manager) resolve(p *Paused) {
 	m.mu.Lock()
 	delete(m.byID, p.ID)
-	delete(m.bySession, p.SessionID)
 	m.mu.Unlock()
 	m.hub.Publish(Event{Kind: EventResumed, Paused: p})
 }
@@ -376,41 +460,10 @@ func (m *Manager) Resume(id uint64, d Decision) bool {
 	return p.Send(d)
 }
 
-// ResumeSession decides the pause of a session, for a client that works with
-// traffic rows rather than pause IDs.
-func (m *Manager) ResumeSession(sessionID uint64, d Decision) bool {
-	m.mu.Lock()
-	p, ok := m.bySession[sessionID]
-	m.mu.Unlock()
-	if !ok {
-		return false
-	}
-	return p.Send(d)
-}
-
 // Enabled reports whether any breakpoint rule is on.
 func (m *Manager) Enabled() bool {
 	for _, r := range *m.rules.Load() {
 		if r.Enabled {
-			return true
-		}
-	}
-	return false
-}
-
-// PendingFor reports the pause of a session, if it is waiting.
-func (m *Manager) PendingFor(sessionID uint64) (*Paused, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	p, ok := m.bySession[sessionID]
-	return p, ok
-}
-
-// InterceptPhase reports whether traffic in this phase could be paused, so the
-// proxy can skip the check.
-func (m *Manager) InterceptPhase(phase Phase) bool {
-	for _, r := range *m.rules.Load() {
-		if r.Enabled && r.Phase == phase && r.Update {
 			return true
 		}
 	}

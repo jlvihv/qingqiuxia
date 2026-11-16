@@ -29,13 +29,52 @@ func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {
 // sentence for a person or a model reading a list, and Spec is the rule as it
 // was written, so that a caller can change one field and write it back. Without
 // the second, reading a rule is not enough to edit it.
+//
+// Effects is marked read-only for decoding: it is what the server computed, and
+// a caller that reads a rule and writes it back sends it along. Rejecting it as
+// an unknown field made the documented read-modify-write round trip fail with a
+// 400.
 type ruleView struct {
 	rule.Spec
 	Effects []string `json:"effects,omitempty"`
 }
 
+// toRuleView describes a rule.
 func toRuleView(r *rule.Rule) ruleView {
 	return ruleView{Spec: r.Spec(), Effects: r.Describe()}
+}
+
+// decodeRuleSpec reads one rule from a request body, ignoring the fields the
+// server computes and fills in itself. A caller may send a rule it just read.
+func decodeRuleSpec(w http.ResponseWriter, r *http.Request) (rule.Spec, bool) {
+	var body struct {
+		rule.Spec
+		// Effects and the other computed fields are accepted and dropped.
+		Effects []string `json:"effects"`
+	}
+	if !decode(w, r, &body) {
+		return rule.Spec{}, false
+	}
+	return body.Spec, true
+}
+
+// decodeRuleList reads a {"rules": [...]} body, ignoring the computed fields, so
+// that a list read from GET can be written back after reordering it.
+func decodeRuleList(w http.ResponseWriter, r *http.Request) ([]rule.Spec, bool) {
+	var body struct {
+		Rules []struct {
+			rule.Spec
+			Effects []string `json:"effects"`
+		} `json:"rules"`
+	}
+	if !decode(w, r, &body) {
+		return nil, false
+	}
+	out := make([]rule.Spec, 0, len(body.Rules))
+	for _, item := range body.Rules {
+		out = append(out, item.Spec)
+	}
+	return out, true
 }
 
 // handleReplaceRules swaps the whole rule set, which is how a GUI reorders
@@ -45,13 +84,11 @@ func (s *Server) handleReplaceRules(w http.ResponseWriter, r *http.Request) {
 	if e == nil {
 		return
 	}
-	var body struct {
-		Rules []rule.Spec `json:"rules"`
-	}
-	if !decode(w, r, &body) {
+	specs, ok := decodeRuleList(w, r)
+	if !ok {
 		return
 	}
-	if err := e.Replace(body.Rules); err != nil {
+	if err := e.Replace(specs); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -93,8 +130,8 @@ func (s *Server) handleAddRule(w http.ResponseWriter, r *http.Request) {
 	if e == nil {
 		return
 	}
-	var spec rule.Spec
-	if !decode(w, r, &spec) {
+	spec, ok := decodeRuleSpec(w, r)
+	if !ok {
 		return
 	}
 	added, err := e.Add(spec)
@@ -244,6 +281,10 @@ func (s *Server) handleAbortPause(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleEditPause changes a paused message's headers or body.
+//
+// The edit runs under the pause's own lock, through Edit: the message is the one
+// the proxy will continue with, and a snapshot taken at the same time must not
+// see half an edit.
 func (s *Server) handleEditPause(w http.ResponseWriter, r *http.Request) {
 	m := s.breakpointManager(w)
 	if m == nil {
@@ -253,21 +294,15 @@ func (s *Server) handleEditPause(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	pending := m.Pending()
-	var target *breakpoint.Paused
-	for _, p := range pending {
-		if p.ID == id {
-			target = p
-			break
-		}
-	}
-	if target == nil {
+	pending, ok := m.PendingByID(id)
+	if !ok {
 		writeError(w, http.StatusNotFound, "no pause with that id")
 		return
 	}
 
 	var body struct {
-		// Side is "request" or "response"; it defaults to the paused side.
+		// Side is "request" or "response". Empty edits the side that stopped,
+		// which is what a caller who does not name one means.
 		Side    string              `json:"side,omitempty"`
 		Headers map[string][]string `json:"headers,omitempty"`
 		Body    *string             `json:"body,omitempty"`
@@ -277,37 +312,47 @@ func (s *Server) handleEditPause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var m2 *msg.Message
-	var resp *msg.Response
-	switch body.Side {
-	case "", "request":
-		if target.Phase == breakpoint.OnResponse && body.Side == "" {
-			m2 = &target.Response.Message
-			resp = target.Response
-		} else {
-			m2 = &target.Request.Message
-		}
-	case "response":
-		if target.Response == nil {
-			writeError(w, http.StatusBadRequest, "this pause has no response")
-			return
-		}
-		m2 = &target.Response.Message
-		resp = target.Response
+	// Which side to edit: the named one, or the one that stopped.
+	side := body.Side
+	if side == "" {
+		side = pending.Phase.String()
 	}
-	if m2 == nil {
-		writeError(w, http.StatusBadRequest, "nothing to edit")
+	if side != "request" && side != "response" {
+		writeError(w, http.StatusBadRequest, `side must be "request" or "response"`)
 		return
 	}
-	if body.Headers != nil {
-		m2.Header = http.Header(body.Headers)
+	if side == "response" && pending.Response == nil {
+		writeError(w, http.StatusBadRequest, "this pause has no response")
+		return
 	}
-	if body.Body != nil {
-		// An edited body is text; the content length follows it.
-		m2.SetBody([]byte(*body.Body))
+	// The live pause is needed for the edit itself; it is fetched again rather
+	// than reused from the copy above, which is not editable.
+	live, ok := m.Live(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "no pause with that id")
+		return
 	}
-	if body.Status != nil && resp != nil {
-		resp.Status = *body.Status
+
+	err := live.Edit(func(req *msg.Request, resp *msg.Response) error {
+		target := &req.Message
+		if side == "response" {
+			target = &resp.Message
+		}
+		if body.Headers != nil {
+			target.Header = http.Header(body.Headers)
+		}
+		if body.Body != nil {
+			// An edited body is text; the content length follows it.
+			target.SetBody([]byte(*body.Body))
+		}
+		if body.Status != nil && side == "response" {
+			resp.Status = *body.Status
+		}
+		return nil
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"edited": true})
 }

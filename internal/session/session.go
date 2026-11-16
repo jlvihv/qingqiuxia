@@ -149,11 +149,12 @@ func NewSession(id uint64, req *msg.Request, now time.Time) *Session {
 }
 
 // Snapshot copies the session. The request and response are deep copied, so
-// later edits by the proxy do not show up in a snapshot already handed out.
+// later edits by the proxy do not show up in a snapshot already handed out, and
+// a caller that writes to one does not reach the store.
 func (s *Session) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snap := Snapshot{
+	return Snapshot{
 		ID:       s.ID,
 		Phase:    s.phase,
 		Source:   s.source,
@@ -163,45 +164,39 @@ func (s *Session) Snapshot() Snapshot {
 		Timings:  s.timings,
 		BytesIn:  s.bytesIn,
 		BytesOut: s.bytesOut,
+		Notes:    copyNotes(s.notes),
 	}
-	if len(s.notes) > 0 {
-		snap.Notes = append([]Note(nil), s.notes...)
+}
+
+// viewInto fills out with the session's fields, sharing the messages. The caller
+// must not keep it: the request and response are the ones the proxy goes on
+// editing, so it is for a decision made while the lock is held, not for a value
+// handed to another goroutine.
+func (s *Session) viewInto(out *Snapshot) {
+	out.ID = s.ID
+	out.Phase = s.phase
+	out.Source = s.source
+	out.Request = s.req
+	out.Response = s.resp
+	out.Err = s.err
+	out.Timings = s.timings
+	out.BytesIn = s.bytesIn
+	out.BytesOut = s.bytesOut
+	out.Notes = copyNotes(s.notes)
+}
+
+// copyNotes copies a note list, so a snapshot's notes are its own.
+func copyNotes(notes []Note) []Note {
+	if len(notes) == 0 {
+		return nil
 	}
-	return snap
+	return append([]Note(nil), notes...)
 }
 
 // SetSource records how the session is being answered.
 func (s *Session) SetSource(src Source) {
 	s.mu.Lock()
 	s.source = src
-	s.mu.Unlock()
-}
-
-// SetDNS records the origin name resolution time.
-func (s *Session) SetDNS(d time.Duration) {
-	s.mu.Lock()
-	s.timings.DNS = d
-	s.mu.Unlock()
-}
-
-// SetConnect records the origin connection time.
-func (s *Session) SetConnect(d time.Duration) {
-	s.mu.Lock()
-	s.timings.Connect = d
-	s.mu.Unlock()
-}
-
-// SetTLS records the origin TLS handshake time.
-func (s *Session) SetTLS(d time.Duration) {
-	s.mu.Lock()
-	s.timings.TLS = d
-	s.mu.Unlock()
-}
-
-// SetTTFB records the time to the response's first body byte.
-func (s *Session) SetTTFB(d time.Duration) {
-	s.mu.Lock()
-	s.timings.TTFB = d
 	s.mu.Unlock()
 }
 
@@ -222,16 +217,24 @@ func (s *Session) SetTimings(t Timings) {
 // recorded one: a snapshot a reader already holds does not change, and a
 // session that is done is history. A rule that changes future traffic does so
 // on the way through, not by editing what was captured.
+//
+// The response is copied for the same reason Begin copies the request: the
+// caller keeps editing the one it passed.
 func (s *Session) SetResponse(resp *msg.Response) {
+	c := resp.Clone()
 	s.mu.Lock()
-	s.resp = resp
+	s.resp = c
 	s.mu.Unlock()
 }
 
 // SetRequest replaces the request, after a rule or a breakpoint edited it.
+//
+// The request is copied, not kept: it is the live one, which the proxy goes on
+// using — and a breakpoint lets a person edit it while the API lists it.
 func (s *Session) SetRequest(req *msg.Request) {
+	c := req.Clone()
 	s.mu.Lock()
-	s.req = req
+	s.req = c
 	s.mu.Unlock()
 }
 
@@ -262,12 +265,19 @@ func (s *Session) Aborted() bool {
 }
 
 // Complete marks the session done, with resp or an error.
+//
+// The response is copied: the proxy still holds the one it passed, and a rule
+// or a breakpoint may still be editing it.
 func (s *Session) Complete(resp *msg.Response, err error, now time.Time) {
+	var stored *msg.Response
+	if resp != nil {
+		stored = resp.Clone()
+	}
 	s.mu.Lock()
 	s.timings.End = now
-	if resp != nil {
-		s.resp = resp
-		s.bytesOut = int64(len(resp.Body))
+	if stored != nil {
+		s.resp = stored
+		s.bytesOut = int64(len(stored.Body))
 		if s.req != nil {
 			s.bytesIn = int64(len(s.req.Body))
 		}
@@ -337,9 +347,16 @@ func NewStore(limit int) *Store {
 func (s *Store) Hub() *events.Hub[Event] { return s.hub }
 
 // Begin starts a session for req and returns it with its new ID.
+//
+// The request is copied rather than kept: the proxy hands in the one it is
+// still working on, and the rules edit that one in place. Holding it here meant a
+// snapshot taken by a list call could clone a header map while a rule was
+// writing it, which is a data race and a wrong snapshot in one. The copy is one
+// header map per exchange; the body is shared, since nothing writes into a body
+// slice.
 func (s *Store) Begin(req *msg.Request, now time.Time) *Session {
 	id := s.ids.Next()
-	sess := NewSession(id, req, now)
+	sess := NewSession(id, req.Clone(), now)
 
 	s.mu.Lock()
 	evicted := s.pushLocked(sess)
@@ -425,6 +442,42 @@ func (s *Store) List(offset, limit int) []Snapshot {
 	return out
 }
 
+// FilterNewest pages through the sessions newest first, keeping those match
+// accepts, and returns how many matched and the requested page of them.
+//
+// The matcher sees a reader's view of each session, not a snapshot: a filter is
+// a question about the row — its URL, status, start time — and copying every
+// body to answer it was how a twenty-row list spent 65 MB. Only the rows that
+// come back are copied.
+//
+// The store's lock is held while the matcher runs, because the ring must not
+// change underneath it, so matcher must be cheap and must not call the store.
+func (s *Store) FilterNewest(offset, limit int, match func(*Snapshot) bool) (total int, page []Snapshot) {
+	if limit < 0 {
+		limit = s.count
+	}
+	// A reader built once and reused: the matcher reads it and does not keep it.
+	view := Snapshot{}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Newest first is the order a capture tool shows, and the order the API
+	// promised. The rows are walked once, and only the wanted page is copied.
+	for i := s.count - 1; i >= 0; i-- {
+		sess := s.ring[(s.start+i)%s.limit]
+		sess.viewInto(&view)
+		if !match(&view) {
+			continue
+		}
+		if total >= offset && len(page) < limit {
+			page = append(page, sess.Snapshot())
+		}
+		total++
+	}
+	return total, page
+}
+
 // Len reports how many sessions are held.
 func (s *Store) Len() int {
 	s.mu.RLock()
@@ -434,9 +487,6 @@ func (s *Store) Len() int {
 
 // Dropped reports how many sessions left the ring.
 func (s *Store) Dropped() uint64 { return s.dropped.Load() }
-
-// IDs reports the last session ID handed out.
-func (s *Store) LastID() uint64 { return s.ids.Peek() }
 
 // Clear empties the store. The ID sequence keeps counting, so a stale
 // reference in a client never matches a new session.

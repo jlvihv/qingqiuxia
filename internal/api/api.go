@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jlvihv/qingqiuxia/internal/breakpoint"
 	"github.com/jlvihv/qingqiuxia/internal/msg"
@@ -50,9 +51,10 @@ type Core struct {
 	// Resources reports the process's resident memory in megabytes and its
 	// goroutine count, for the window's status bar.
 	Resources func() (memoryMB uint64, goroutines int)
-	// Base is how a caller reaches this API, as "http://127.0.0.1:8898". The
-	// index uses it so its examples can be pasted as they are.
-	Base string
+	// CachedCertificates reports how many leaf certificates the issuer holds,
+	// which the status call shows: a HTTPS capture that mints one per host is
+	// worth seeing the cost of.
+	CachedCertificates func() int
 	// Proxy steers the proxy's own listener. It is what the control API offers
 	// on /api/proxy, and it is separate from the traffic side: the proxy's
 	// address is what a client is pointed at, while this API is what a tool
@@ -231,6 +233,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			st.Paused = m.PauseCount()
 		}
 	}
+	if s.core.CachedCertificates != nil {
+		st.Certs = s.core.CachedCertificates()
+	}
 	writeJSON(w, http.StatusOK, st)
 }
 
@@ -327,21 +332,10 @@ func toSessionJSON(s session.Snapshot, detail bool) sessionJSON {
 
 // toMessageJSON describes a message's headers and body.
 func toMessageJSON(m *msg.Message) messageJSON {
-	out := messageJSON{
-		Headers:     map[string][]string(m.Header),
-		ContentType: m.Header.Get("Content-Type"),
-		Truncated:   m.Truncated,
-		Streaming:   m.Stream != nil,
-	}
-	if len(m.Body) > 0 {
-		if msg.IsText(m.ContentType()) {
-			out.Body = string(m.Body)
-			out.BodyEncoding = "text"
-		} else {
-			out.Body = base64.StdEncoding.EncodeToString(m.Body)
-			out.BodyEncoding = "base64"
-		}
-	}
+	out := *headersOf(m)
+	b := bodyOf(m)
+	out.Body = b.Body
+	out.BodyEncoding = b.BodyEncoding
 	return out
 }
 
@@ -360,30 +354,27 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	store := s.core.Pipeline.Sessions()
-	// 过滤在服务端做：按字节付费的调用方要的是它想要的那三行，不是两百行让它
-	// 自己去筛。
-	all := store.List(0, -1)
-	kept := make([]session.Snapshot, 0, len(all))
-	// 最新的在前，这也是流量列表的顺序。
-	for i := len(all) - 1; i >= 0; i-- {
-		if f.matches(&all[i]) {
-			kept = append(kept, all[i])
-		}
+	if f.offset < 0 {
+		// A negative offset is a typo, not a request to read backwards from the
+		// end: clamping keeps it out of a slice bound.
+		f.offset = 0
 	}
-	total := len(kept)
-	end := min(f.offset+f.limit, total)
-	if f.offset > total {
-		f.offset = total
-	}
-	kept = kept[f.offset:end]
+
+	// The filter runs on the store's own views, and only the page that survives
+	// it is copied: snapshots deep-copy every body, and a filter that answers
+	// "is there a 500" did not need two hundred bodies to do it. The whole list
+	// was copied before this, which cost 65 MB for a twenty-row answer.
+	total, page := store.FilterNewest(f.offset, f.limit, func(snap *session.Snapshot) bool {
+		return f.matches(snap)
+	})
 
 	if f.table {
-		writeTable(w, f, kept, total, store.Dropped())
+		writeTable(w, f, page, total, store.Dropped())
 		return
 	}
-	out := make([]sessionJSON, 0, len(kept))
-	for i := range kept {
-		out = append(out, toSessionJSON(kept[i], false))
+	out := make([]sessionJSON, 0, len(page))
+	for i := range page {
+		out = append(out, toSessionJSON(page[i], false))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sessions": out,
@@ -490,21 +481,30 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	maxBody := intParam(r, "max", 0)
+	if maxBody < 0 {
+		// A negative maximum is a typo; without this it sliced a string past its
+		// start and panicked the handler.
+		writeError(w, http.StatusBadRequest, "max must not be negative")
+		return
+	}
 	out := toSessionJSON(snap, false)
 	switch part {
-	case "all", "body":
+	case "all":
 		out = toSessionJSON(snap, true)
+	case "body":
+		// Body only, without the headers: the whole point of the part split is
+		// that a caller asking why a request failed does not pay for two header
+		// maps it will not read.
+		out = toSessionJSON(snap, false)
+		out.Request = requestBody(snap.Request)
+		out.Response = responseBody(snap.Response)
 	case "summary":
-		// The row, which is what a list already gives, plus what the row
-		// leaves out and a summary does not.
+		// The row, which is what a list already gives, plus what the row leaves
+		// out and a summary does not.
 	case "headers":
 		out = toSessionJSON(snap, false)
-		if snap.Request != nil {
-			out.Request = headersOnly(&snap.Request.Message, maxBody)
-		}
-		if snap.Response != nil {
-			out.Response = headersOnly(&snap.Response.Message, maxBody)
-		}
+		out.Request = requestHeaders(snap.Request)
+		out.Response = responseHeaders(snap.Response)
 	}
 	if maxBody > 0 {
 		truncateBodies(out.Request, maxBody)
@@ -513,11 +513,38 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// headersOnly 只描述头部，不带 body。
-func headersOnly(m *msg.Message, _ int) *messageJSON {
-	if m == nil {
+// requestBody, responseBody, requestHeaders and responseHeaders describe one
+// side of an exchange with only the part asked for.
+func requestBody(r *msg.Request) *messageJSON {
+	if r == nil {
 		return nil
 	}
+	return bodyOf(&r.Message)
+}
+
+func responseBody(r *msg.Response) *messageJSON {
+	if r == nil {
+		return nil
+	}
+	return bodyOf(&r.Message)
+}
+
+func requestHeaders(r *msg.Request) *messageJSON {
+	if r == nil {
+		return nil
+	}
+	return headersOf(&r.Message)
+}
+
+func responseHeaders(r *msg.Response) *messageJSON {
+	if r == nil {
+		return nil
+	}
+	return headersOf(&r.Message)
+}
+
+// headersOf describes one message's headers.
+func headersOf(m *msg.Message) *messageJSON {
 	return &messageJSON{
 		Headers:     map[string][]string(m.Header),
 		ContentType: m.Header.Get("Content-Type"),
@@ -526,15 +553,54 @@ func headersOnly(m *msg.Message, _ int) *messageJSON {
 	}
 }
 
+// bodyOf describes one message's body.
+func bodyOf(m *msg.Message) *messageJSON {
+	out := &messageJSON{
+		ContentType: m.Header.Get("Content-Type"),
+		Truncated:   m.Truncated,
+		Streaming:   m.Stream != nil,
+	}
+	if len(m.Body) > 0 {
+		if msg.IsText(m.ContentType()) {
+			out.Body = string(m.Body)
+			out.BodyEncoding = "text"
+		} else {
+			out.Body = base64.StdEncoding.EncodeToString(m.Body)
+			out.BodyEncoding = "base64"
+		}
+	}
+	return out
+}
+
 // truncateBodies 把 body 截到 n 字节，并且标明截断了：悄悄少一截的 body 会
 // 让人以为工具坏了。
 func truncateBodies(m *messageJSON, n int) {
 	if m == nil || len(m.Body) <= n {
 		return
 	}
-	// body 可能已经是 base64，按字节切会切断编码。对读的人来说切文本就够了，
-	// 真实大小本来也在行里。
-	m.Body = m.Body[:n]
+	if m.BodyEncoding == "base64" {
+		// Cutting base64 produces something that does not decode, so the caller
+		// would get corrupt bytes it cannot tell from a malformed body. Cut the
+		// underlying bytes and encode those instead.
+		raw, err := base64.StdEncoding.DecodeString(m.Body)
+		if err == nil {
+			if len(raw) > n {
+				raw = raw[:n]
+			}
+			m.Body = base64.StdEncoding.EncodeToString(raw)
+			m.Truncated = true
+			return
+		}
+		// It was not valid base64 to begin with; a text cut is the least
+		// misleading thing left to do.
+	}
+	// Cut at a rune boundary: half a multi-byte character is not text a reader
+	// can use, and JSON will not encode it.
+	cut := n
+	for cut > 0 && !utf8.RuneStart(m.Body[cut]) {
+		cut--
+	}
+	m.Body = m.Body[:cut]
 	m.Truncated = true
 }
 

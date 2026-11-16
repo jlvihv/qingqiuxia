@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net/http"
 	"sync/atomic"
 	"time"
 
@@ -215,10 +216,14 @@ func (p *Pipeline) Response(ctx context.Context, ex *proxy.Exchange, resp *msg.R
 	}
 	if ic.Matched {
 		if ic.Abort {
+			// An abort on the response side replaces what the client would get:
+			// the origin's response was already fetched, but forwarding it now
+			// would ignore the decision the person made.
 			if sess != nil {
+				sess.SetSource(session.Aborted)
 				sess.AddNote(session.Note{At: time.Now(), Kind: "breakpoint", Text: "aborted at a response breakpoint"})
 			}
-			return resp, nil
+			return statusResponse(breakpoint.StatusForAbort), nil
 		}
 		if ic.Response != nil {
 			if sess != nil {
@@ -228,6 +233,18 @@ func (p *Pipeline) Response(ctx context.Context, ex *proxy.Exchange, resp *msg.R
 		}
 	}
 	return resp, nil
+}
+
+// statusResponse is the empty response an abort answers with.
+func statusResponse(status int) *msg.Response {
+	if status == 0 {
+		status = http.StatusForbidden
+	}
+	return &msg.Response{
+		Status:  status,
+		Reason:  http.StatusText(status),
+		Message: msg.Message{Header: http.Header{}},
+	}
 }
 
 // Complete records the end of an exchange.

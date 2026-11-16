@@ -3,10 +3,9 @@ package ui
 import "time"
 
 // SeedDemo fills a store with traffic that looks like a real debugging session,
-// so that the layout can be judged before the API client exists.
+// so the layout can be judged without a proxy behind it.
 //
-// It lives here rather than in a test so the window can be started with
-// -demo, which is how the interface is worked on without a proxy running.
+// The layout tests are its only caller: it fills the rows a rendering test draws.
 func SeedDemo(s *Store) {
 	now := time.Now()
 	type row struct {

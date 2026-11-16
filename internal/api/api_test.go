@@ -345,7 +345,7 @@ func TestPauseAbortOverAPI(t *testing.T) {
 		out, _ := ts.pauses.Intercept(t.Context(), 1, breakpoint.OnRequest, msgReq.Clone(), nil)
 		done <- out
 	}()
-	var pending *breakpoint.Paused
+	var pending breakpoint.Snapshot
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if list := ts.pauses.Pending(); len(list) > 0 {
@@ -354,7 +354,7 @@ func TestPauseAbortOverAPI(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if pending == nil {
+	if pending.ID == 0 {
 		t.Fatal("nothing paused")
 	}
 	if code := ts.do(t, "POST", "/api/pauses/"+itoa(pending.ID)+"/abort", nil, nil); code != 200 {

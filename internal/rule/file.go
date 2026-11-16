@@ -21,10 +21,3 @@ func ParseSpecs(data []byte) ([]Spec, error) {
 	}
 	return list, nil
 }
-
-// MarshalSpecs writes specs as a {"rules": [...]} object.
-func MarshalSpecs(specs []Spec) ([]byte, error) {
-	return json.MarshalIndent(struct {
-		Rules []Spec `json:"rules"`
-	}{Rules: specs}, "", "  ")
-}

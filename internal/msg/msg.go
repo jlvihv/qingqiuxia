@@ -25,11 +25,17 @@ type Message struct {
 	// Body holds the body bytes as they went on the wire, still encoded as
 	// the Content-Encoding header says. Rules decode and re-encode it around
 	// their edits, so what the client receives stays encoded the same way.
+	//
+	// A snapshot copies this, and the copy costs the body's size: the core's
+	// largest allocation under load. It is copied because the proxy keeps editing
+	// the message it captured, and a snapshot must not move under a reader.
 	Body []byte
 
-	// Stream holds the body when it was not buffered: a live stream such as
-	// server-sent events, or a body longer than the capture limit. Body and
-	// Stream are never both set.
+	// Stream holds the rest of a body that was not buffered: a live stream such
+	// as server-sent events, or the part of a long body past the capture limit.
+	// When Body is also set, Body is the start that was kept for inspection and
+	// Stream carries what still has to reach the client, so the two together are
+	// the whole body.
 	Stream ReadCloser
 
 	// Truncated reports that Body is only the start of a longer body, because
@@ -84,7 +90,7 @@ func (m *Message) Close() {
 	}
 }
 
-// cloneMessage deep copies the parts a snapshot must own.
+// cloneMessage copies the parts a snapshot must own.
 func (m *Message) cloneMessage() Message {
 	c := Message{Truncated: m.Truncated}
 	if m.Header != nil {

@@ -37,7 +37,7 @@ func TestInterceptWaitsForDecision(t *testing.T) {
 		done <- result{out, err}
 	}()
 
-	var pending *Paused
+	var pending Snapshot
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if list := m.Pending(); len(list) > 0 {
@@ -46,15 +46,24 @@ func TestInterceptWaitsForDecision(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if pending == nil {
+	if pending.ID == 0 {
 		t.Fatal("nothing paused")
 	}
 	if pending.SessionID != 7 {
 		t.Errorf("session = %d", pending.SessionID)
 	}
 
-	// Edit the paused request, as the API does, then release it.
-	pending.Request.SetHeader("X-Edited", "yes")
+	// Edit the paused request, as the API does, then release it. The edit goes
+	// through the live pause: a Snapshot is a copy, and editing one changes
+	// nothing.
+	live, ok := m.Live(pending.ID)
+	if !ok {
+		t.Fatal("the pause went away")
+	}
+	live.Edit(func(req *msg.Request, _ *msg.Response) error {
+		req.SetHeader("X-Edited", "yes")
+		return nil
+	})
 	if !m.Resume(pending.ID, Release) {
 		t.Fatal("resume failed")
 	}
@@ -152,7 +161,7 @@ func TestContextCancel(t *testing.T) {
 }
 
 // waitPending waits for a pause to appear.
-func waitPending(t *testing.T, m *Manager) *Paused {
+func waitPending(t *testing.T, m *Manager) Snapshot {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -162,5 +171,5 @@ func waitPending(t *testing.T, m *Manager) *Paused {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("nothing paused")
-	return nil
+	return Snapshot{}
 }

@@ -20,13 +20,13 @@ const indexText = `请求侠 (qingqiuxia) 控制接口
 == 回答大部分问题的三个调用 ==
 
   # 已经抓到了什么，最新的在前
-  curl -s 'API/api/sessions?limit=20&shape=table'
+  curl -s '{{BASE}}/api/sessions?limit=20&shape=table'
 
   # 一次请求的摘要：url、状态、各段耗时，约 230 字节
-  curl -s 'API/api/sessions/ID?part=summary'
+  curl -s '{{BASE}}/api/sessions/ID?part=summary'
 
   # 它跑着吗、在录吗、代理在哪
-  curl -s 'API/api/status'
+  curl -s '{{BASE}}/api/status'
 
 == 有意识地少要一点 ==
 
@@ -72,19 +72,19 @@ const indexText = `请求侠 (qingqiuxia) 控制接口
   abort    直接拒绝
 
   # 一个 Mock：路径以 /login 结尾的请求都返回 200 和这个 body
-  curl -s -X POST API/api/rules -H 'Content-Type: application/json' -d '{
+  curl -s -X POST {{BASE}}/api/rules -H 'Content-Type: application/json' -d '{
     "name":"登录打桩","kind":"mock","phase":"request","pattern":"*/login",
     "mock":{"status":200,"body":"{\\"token\\":\\"假的\\"}","contentType":"application/json"}}'
 
   # 一个改写：把响应里所有的 secret 换成 ***
-  curl -s -X POST API/api/rules -H 'Content-Type: application/json' -d '{
+  curl -s -X POST {{BASE}}/api/rules -H 'Content-Type: application/json' -d '{
     "name":"打码","kind":"rewrite","phase":"response","pattern":"*",
     "actions":[{"type":"replace-body","find":"secret","replace":"***"}]}'
 
-  GET    API/api/rules            列出全部（每条都带 actions，能原样读回）
-  GET    API/api/rules/ID         只看一条：改之前先读它
-  PATCH  API/api/rules/ID         {"enabled":false} 停用某条
-  DELETE API/api/rules/ID         删除
+  GET    {{BASE}}/api/rules            列出全部（每条都带 actions，能原样读回）
+  GET    {{BASE}}/api/rules/ID         只看一条：改之前先读它
+  PATCH  {{BASE}}/api/rules/ID         {"enabled":false} 停用某条
+  DELETE {{BASE}}/api/rules/ID         删除
 
   列表里每条有两部分：actions 是规则本身（能读出来改一个字段再写回去），
   effects 是一句人话，说明它实际会做什么。
@@ -99,31 +99,31 @@ replace-body、set-status、redirect。
 
 断点规则把匹配到的流量停下来，等人决定：
 
-  curl -s -X PUT API/api/breakpoints -H 'Content-Type: application/json' \
+  curl -s -X PUT {{BASE}}/api/breakpoints -H 'Content-Type: application/json' \
     -d '{"breakpoints":[{"name":"登录","phase":"request","pattern":"*/login"}]}'
 
-  curl -s API/api/pauses                       现在停着哪些
-  curl -s -X PUT API/api/pauses/ID \
+  curl -s {{BASE}}/api/pauses                       现在停着哪些
+  curl -s -X PUT {{BASE}}/api/pauses/ID \
     -H 'Content-Type: application/json' \
     -d '{"headers":{"Authorization":["Bearer test"]}}'
-  curl -s -X POST API/api/pauses/ID/resume     放行
-  curl -s -X POST API/api/pauses/ID/abort      拒绝
+  curl -s -X POST {{BASE}}/api/pauses/ID/resume     放行
+  curl -s -X POST {{BASE}}/api/pauses/ID/abort      拒绝
 
 被拦下的请求会一直占着客户端，所以记得放行：没人处理的断点五分钟后超时。
 
 == 代理本身 ==
 
-  curl -s API/api/proxy                        在监听吗，在哪
-  curl -s -X POST API/api/proxy/start \
+  curl -s {{BASE}}/api/proxy                        在监听吗，在哪
+  curl -s -X POST {{BASE}}/api/proxy/start \
     -H 'Content-Type: application/json' -d '{"addr":"0.0.0.0:8899"}'
-  curl -s -X POST API/api/proxy/stop
+  curl -s -X POST {{BASE}}/api/proxy/stop
 
   代理和这个控制接口是两个不同的监听。代理是给被调试的客户端连的，这个接口
   是给工具连的。代理可以停掉，这个接口照样回答。
 
 == 持续观察，而不是反复问 ==
 
-  curl -sN API/api/events
+  curl -sN {{BASE}}/api/events
 
 服务端推送事件：每行一个 JSON，事件名是 session、dropped、paused 或 resumed。
 连接不断就一直推。
@@ -138,7 +138,7 @@ replace-body、set-status、redirect。
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	body := indexText
 	if base := s.baseURL(r); base != "" {
-		body = replaceAll(body, "API", base)
+		body = replaceAll(body, "{{BASE}}", base)
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Qingqiuxia-Api-Version", itoa(APIVersion))

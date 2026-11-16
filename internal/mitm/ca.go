@@ -31,8 +31,6 @@ type CA struct {
 	Key *ecdsa.PrivateKey
 	// PEM is the authority certificate in PEM form, for the client to install.
 	PEM []byte
-
-	tlsCert cacheEntry // the authority's own certificate, in TLS form
 }
 
 // cacheEntry is a certificate as crypto/tls wants it, with its expiry.
@@ -88,10 +86,6 @@ func Generate(commonName string) (*CA, error) {
 	}
 	ca := &CA{Cert: cert, Key: key}
 	ca.PEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	ca.tlsCert = cacheEntry{
-		cert:    &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: cert},
-		expires: cert.NotAfter,
-	}
 	return ca, nil
 }
 
@@ -146,12 +140,7 @@ func Parse(certPEM, keyPEM []byte) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mitm: parse key: %w", err)
 	}
-	ca := &CA{Cert: cert, Key: key, PEM: certPEM}
-	ca.tlsCert = cacheEntry{
-		cert:    &tls.Certificate{Certificate: [][]byte{cert.Raw}, PrivateKey: key, Leaf: cert},
-		expires: cert.NotAfter,
-	}
-	return ca, nil
+	return &CA{Cert: cert, Key: key, PEM: certPEM}, nil
 }
 
 // LoadOrCreate loads the authority from dir, creating and saving one when the
@@ -187,10 +176,6 @@ func LoadOrCreate(dir, commonName string) (*CA, error) {
 	}
 	return ca, nil
 }
-
-// TLSCert returns the authority's own certificate for clients that connect to
-// it directly, which some clients do before sending a CONNECT.
-func (ca *CA) TLSCert() *tls.Certificate { return ca.tlsCert.cert }
 
 // randomSerial makes a serial number for a certificate, chosen at random as
 // the CA/Browser Forum requires of an issuer.

@@ -1,9 +1,6 @@
 package ui
 
-import (
-	"context"
-	"time"
-)
+import "context"
 
 // Backend is what the window needs from the core.
 //
@@ -88,5 +85,3 @@ type Control interface {
 	// StopProxy stops serving and releases the port.
 	StopProxy() error
 }
-
-var _ = time.Second

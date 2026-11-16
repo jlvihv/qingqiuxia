@@ -1,8 +1,6 @@
 package rule
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -333,17 +331,6 @@ func messageOf(req *msg.Request, resp *msg.Response) *msg.Message {
 		return &resp.Message
 	}
 	return nil
-}
-
-// JSONBody sets a body from a value, useful for mocks.
-func JSONBody(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // spec returns the action as it was written, so that a rule can be read back and

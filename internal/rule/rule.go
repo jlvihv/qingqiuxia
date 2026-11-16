@@ -176,6 +176,10 @@ func guessContentType(body string) string {
 // Spec returns the rule as the API describes it, so that a caller can read a
 // rule, change one field, and write it back: a list of effects is readable but
 // cannot be round-tripped.
+//
+// Every field a Spec can carry has to come back out here, or reading a rule and
+// writing it again silently drops it. Methods was the one that got away: a rule
+// restricted to POST matched every method after one round trip.
 func (r *Rule) Spec() Spec {
 	s := Spec{
 		ID:       r.ID,
@@ -183,6 +187,7 @@ func (r *Rule) Spec() Spec {
 		Kind:     r.Kind.String(),
 		Phase:    r.Phase.String(),
 		Pattern:  r.Matcher.String(),
+		Methods:  r.Matcher.MethodSet(),
 		Priority: r.Priority,
 	}
 	enabled := r.Enabled
@@ -270,6 +275,11 @@ func (e *Engine) Len() int { return len(e.current.Load().rules) }
 // Replace swaps the whole rule set, assigning IDs to specs that have none and
 // compiling everything before publishing, so a bad rule leaves the old set in
 // place.
+//
+// The order the specs arrive in is the order they match in. It used to be thrown
+// away and rebuilt from Priority and ID, which made PUT /api/rules — documented
+// as the way to reorder — a no-op: the caller's order was discarded and the old
+// one came back.
 func (e *Engine) Replace(specs []Spec) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -297,7 +307,9 @@ func (e *Engine) Replace(specs []Spec) error {
 		rs.rules = append(rs.rules, r)
 		rs.byID[id] = r
 	}
-	sortRules(rs.rules)
+	// Priority still orders: it is a rule's own declaration, and a caller that
+	// sets it expects it to hold wherever the rule sits in the list.
+	sortByPriority(rs.rules)
 	e.nextID = next
 	e.current.Store(rs)
 	return nil
@@ -428,6 +440,19 @@ func sortRules(rules []*Rule) {
 			return rules[i].Priority > rules[j].Priority
 		}
 		return rules[i].ID < rules[j].ID
+	})
+}
+
+// sortByPriority orders rules by priority alone, keeping the order they arrived
+// in among rules of the same priority.
+//
+// It is what Replace uses, and it is the difference between a list whose order is
+// the caller's and one whose order is the engine's: a stable sort by priority
+// leaves equal priorities where they were put, where sorting by ID as well
+// silently reordered them.
+func sortByPriority(rules []*Rule) {
+	sort.SliceStable(rules, func(i, j int) bool {
+		return rules[i].Priority > rules[j].Priority
 	})
 }
 

@@ -20,11 +20,18 @@ type App struct {
 
 	// Selected is the row the user chose, -1 for none.
 	Selected int
+	// SelectedID is the session that row held when it was chosen. New traffic
+	// arrives at the front and pushes every row down, so a row number does not
+	// name a session for long: the choice follows the session by ID instead.
+	SelectedID uint64
 	// Detail is the tab the detail panel shows.
 	Detail int
 	// SidebarWidth and MainWidth are the two splits' first panes, which the
 	// dividers adjust: the sidebar, and the traffic list.
 	SidebarWidth, MainWidth float32
+	// WindowWidth and WindowHeight are the window's own size, recorded when it
+	// closes so the next run opens the same shape.
+	WindowWidth, WindowHeight float32
 
 	// Paused is the message waiting at a breakpoint, if one is.
 	Paused *Paused
@@ -170,11 +177,11 @@ func (a *App) Invalidate() {
 // is what a proxy produces, and walking thousands of rows per arrival is what
 // makes a live list stutter.
 //
-// It is only valid for an arrival. The core publishes a session twice — once
-// when it starts and once when it ends — and an update is not an arrival: it
-// rewrites a row where it is. Calling this for one shifted every row by a place
-// and put a zero at the front, so a list of six grew a second band of six rows
-// that held nothing and still took the pointer.
+// It is only valid for an arrival, and only while the store is still growing.
+// A full store does not append: it overwrites its oldest row in place, so the
+// number of rows does not change and shifting the visible indices by one puts
+// the last one past the end — a blank row that still took the pointer. That case
+// falls back to a full invalidation, which is what an eviction really is.
 func (a *App) InvalidateAppend(id uint64) {
 	a.hostsDirty = true
 	if a.visibleDirty || a.visible == nil {
@@ -188,7 +195,12 @@ func (a *App) InvalidateAppend(id uint64) {
 		return
 	}
 	// A row is its distance from the newest session, so a new one at the front
-	// pushes every existing row down by one.
+	// pushes every existing row down by one — unless the store was full, in
+	// which case a row fell off the other end and nothing moved.
+	if a.Store.Len() >= a.Store.Limit() {
+		a.Invalidate()
+		return
+	}
 	for i := range a.visible {
 		a.visible[i]++
 	}
@@ -250,6 +262,51 @@ func (a *App) SelectedSession() (Session, bool) {
 	return a.Store.At(rows[a.Selected])
 }
 
+// reselectChosen moves the chosen row so that it holds SelectedID again, after
+// the list shifted under it. It is a no-op when the row already holds it, which
+// is the common case: only an arrival at the front moves the rows.
+func (a *App) reselectChosen(rows []int) bool {
+	for i, idx := range rows {
+		if sess, ok := a.Store.At(idx); ok && sess.ID == a.SelectedID {
+			a.Selected = i
+			return true
+		}
+	}
+	// The chosen session left the list — it was dropped, or the filter hides it.
+	// A row that no longer exists must not stay chosen.
+	a.Selected = -1
+	a.SelectedID = 0
+	return false
+}
+
+// syncSelectionID records which session the chosen row currently holds, and
+// puts the choice back on the session it held before the rows moved.
+//
+// The two halves are one call because they are one invariant: Selected is a row,
+// SelectedID is the session that row means, and a frame starts by making them
+// agree again.
+func (a *App) syncSelectionID(rows []int) {
+	if a.Selected < 0 || a.Selected >= len(rows) {
+		if a.Selected >= 0 {
+			// Out of range after a filter narrowed the list: nothing is chosen.
+			a.Selected = -1
+		}
+		a.SelectedID = 0
+		return
+	}
+	if a.SelectedID != 0 {
+		if sess, ok := a.Store.At(rows[a.Selected]); !ok || sess.ID != a.SelectedID {
+			// The rows moved under the choice; find the session again.
+			if !a.reselectChosen(rows) {
+				return
+			}
+		}
+	}
+	if sess, ok := a.Store.At(rows[a.Selected]); ok {
+		a.SelectedID = sess.ID
+	}
+}
+
 // View builds the window's interface for a frame.
 func (a *App) View(c *ui.Context) {
 	// The theme is set on the context, not passed to the window: it is what
@@ -291,7 +348,7 @@ func (a *App) toolbar(c *ui.Context, p *Palette) {
 		}
 		a.chip(c, p, "CA", ca)
 		ui.Text(c, "流量").TextColor(p.Text).FontSize(tokenFontUI)
-		ui.Text(c, fmt.Sprintf("规则 %d", 0)).TextColor(p.TextMuted).FontSize(tokenFontUI)
+		ui.Text(c, fmt.Sprintf("规则 %d", a.RuleCount)).TextColor(p.TextMuted).FontSize(tokenFontUI)
 		if a.Paused != nil {
 			ui.Text(c, "断点 1").TextColor(p.Danger).FontSize(tokenFontUI)
 		}
@@ -509,6 +566,12 @@ var columns = []ui.TableColumn{
 // table draws the sessions, one row per match.
 func (a *App) table(c *ui.Context, p *Palette) {
 	rows := a.Visible()
+	// The framework writes the chosen row number straight into Selected, so the
+	// session behind it has to be recorded once per frame: the next frame can
+	// then put the choice back on that session after an arrival pushed the rows
+	// down. Without this the selection drifted to whatever row the new traffic
+	// left at the same number.
+	a.syncSelectionID(rows)
 	if a.list == nil {
 		a.list = &ui.ListState{}
 		// A chosen row is filled with a subdued accent rather than the accent
@@ -612,8 +675,6 @@ func (a *App) badge(c *ui.Context, p *Palette, text string, colour ui.Color) {
 	ui.Text(c, text).FontSize(tokenFontMicro).PaddingX(5).Radius(tokenRadiusBadge).
 		TextColor(colour).SingleLine()
 }
-
-var _ = ui.Column
 
 // negativeKey is a row key for a row that has no session, kept out of the range
 // sessions use so it cannot collide with one.

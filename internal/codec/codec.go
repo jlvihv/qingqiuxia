@@ -160,27 +160,6 @@ func Encode(body []byte, contentEncoding string) ([]byte, error) {
 	return body, nil
 }
 
-// EditableBody returns the body as decoded text for a rule to edit, plus the
-// coding to restore with Reencode. It reports false when the body cannot be
-// handled as text: a stream, a truncated body, a binary media type or an
-// unknown coding.
-func EditableBody(m *msg.Message) (text []byte, ok bool) {
-	if !m.Buffered() || m.Truncated {
-		return nil, false
-	}
-	if !msg.IsText(m.ContentType()) {
-		return nil, false
-	}
-	if !Supported(m.Header.Get("Content-Encoding")) {
-		return nil, false
-	}
-	decoded, err := Decode(m.Body, m.Header.Get("Content-Encoding"))
-	if err != nil || len(decoded) > MaxDecoded {
-		return nil, false
-	}
-	return decoded, true
-}
-
 // Reencode replaces a message's body with edited text, restoring the content
 // coding it arrived with and keeping Content-Length in step. The caller is
 // expected to have got text from EditableBody.

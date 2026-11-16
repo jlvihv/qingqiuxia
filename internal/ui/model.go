@@ -229,14 +229,30 @@ func (s *Store) Has(id uint64) bool {
 }
 
 // Remove forgets a session, which the core dropped from its ring.
+//
+// It rebuilds the slice instead of splicing it. The store is a ring: once it is
+// full, new sessions overwrite the oldest in place and window says where the
+// oldest one now is. Splicing shifts every index by one but leaves window
+// pointing at the same slot, so the rows after the removed one came out in the
+// wrong order — the newest row was deleted and the two after it swapped.
 func (s *Store) Remove(id uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	i, ok := s.byID[id]
-	if !ok {
+	if _, ok := s.byID[id]; !ok {
 		return
 	}
-	s.sessions = append(s.sessions[:i], s.sessions[i+1:]...)
+	// Rewrite in window order (oldest first), keeping every row but this one,
+	// then start the ring over at zero. That is O(n) for a rare event, and it
+	// makes the invariant plain: sessions are in ring order, window is zero.
+	kept := make([]Session, 0, len(s.sessions))
+	for i := 0; i < len(s.sessions); i++ {
+		sess := s.sessions[(s.window+i)%len(s.sessions)]
+		if sess.ID != id {
+			kept = append(kept, sess)
+		}
+	}
+	s.sessions = kept
+	s.window = 0
 	s.reindexLocked()
 }
 
@@ -261,10 +277,18 @@ func (s *Store) Len() int {
 	return len(s.sessions)
 }
 
+// Limit reports how many sessions the window holds at most.
+func (s *Store) Limit() int { return s.limit }
+
 // Clear empties the window's list.
+//
+// window is reset with it: leaving it pointing past the end of an empty slice
+// meant the next fill started at that offset, and the row that landed there was
+// never shown.
 func (s *Store) Clear() {
 	s.mu.Lock()
 	s.sessions = nil
+	s.window = 0
 	clear(s.byID)
 	s.mu.Unlock()
 }

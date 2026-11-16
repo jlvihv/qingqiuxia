@@ -188,11 +188,12 @@ func buildCore(cfg config) (*core, error) {
 		return nil, err
 	}
 	sessions := session.NewStore(cfg.sessionLimit)
+	issuer := mitm.NewIssuer(ca)
 	pol := pipeline.New(pipeline.Options{
 		Rules:       rules,
 		Breakpoints: breakpoint.NewManager(0),
 		Sessions:    sessions,
-		Issuer:      mitm.NewIssuer(ca),
+		Issuer:      issuer,
 		ShouldIntercept: func(string) bool {
 			return cfg.interceptAll
 		},
@@ -222,6 +223,9 @@ func buildCore(cfg config) (*core, error) {
 		SetCapture: pol.SetRecording,
 		Repeat:     repeater(pr),
 		Resources:  api.ProcessResources,
+		// A leaf certificate per host is the cost of HTTPS capture, and the
+		// status call is where a user sees it.
+		CachedCertificates: issuer.CachedCount,
 		RulesChanged: func(specs []rule.Spec) {
 			// 规则一改就落盘：写规则的人不想因为窗口崩了就重写一遍。
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -421,7 +425,18 @@ func (c *core) serveWithWindow() error {
 		<-sig
 		mygo.RunOnMain(func() { mygo.App.Quit() })
 	}()
-	return mygo.App.Run()
+	err := mygo.App.Run()
+	// The window is gone and its shape is final: write it down here, which is the
+	// only place that knows both the widgets and the moment they stopped. It was
+	// never called before, so the window opened at its default size every time
+	// even though the store had a row for it.
+	if win != nil {
+		if w, h := win.Size(); w > 0 && h > 0 {
+			app.WindowWidth, app.WindowHeight = float32(w), float32(h)
+		}
+	}
+	c.rememberWindow(app)
+	return err
 }
 
 // follow keeps the window's copy of the core's state current: the traffic
@@ -705,6 +720,8 @@ func (c *core) rememberWindow(app *qqx.App) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	w := pstore.Window{
+		Width:        app.WindowWidth,
+		Height:       app.WindowHeight,
 		SidebarWidth: app.SidebarWidth,
 		MainWidth:    app.MainWidth,
 		Detail:       app.Detail,

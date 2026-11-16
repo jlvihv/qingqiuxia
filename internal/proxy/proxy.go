@@ -98,6 +98,12 @@ type Proxy struct {
 	// stopDone is closed when the running server has finished, so a Stop can
 	// wait for every connection to be done rather than cut them.
 	stopDone chan struct{}
+	// stopCtx is the parent of every request's context, and stopCancel ends
+	// them. A request blocked far from its socket — on a breakpoint waiting for
+	// a person, say — has nothing to unblock it when the port closes, so Stop
+	// cancels the exchanges themselves rather than only their connections.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
 }
 
 // New returns a proxy that asks p about every exchange. Call Serve or Listen to
@@ -205,13 +211,18 @@ func (p *Proxy) Start(addr string) (string, error) {
 	}
 	p.ln = ln
 	p.addr = ln.Addr().String()
+	// Every request's context descends from this one, so Stop can end an
+	// exchange that is waiting somewhere a closed socket does not reach.
+	runCtx, runCancel := context.WithCancel(context.Background())
 	srv := &http.Server{
 		Handler:           p,
 		ReadHeaderTimeout: p.tune.HandshakeTime,
 		IdleTimeout:       p.tune.IdleTimeout,
 		ErrorLog:          log.New(io.Discard, "", 0),
+		BaseContext:       func(net.Listener) context.Context { return runCtx },
 	}
 	p.srv = srv
+	p.stopCtx, p.stopCancel = runCtx, runCancel
 	done := make(chan struct{})
 	p.stopDone = done
 	p.started.Store(true)
@@ -227,14 +238,16 @@ func (p *Proxy) Start(addr string) (string, error) {
 			p.logf("proxy stopped: %v", err)
 		}
 	}()
-	return p.addr, nil
+	// The address is read from the listener, not from p.addr: a Stop may have
+	// cleared that field between the unlock above and here.
+	return ln.Addr().String(), nil
 }
 
 // Stop stops serving and closes every connection. The proxy can be started
 // again afterwards, on the same port or another.
 func (p *Proxy) Stop() error {
 	p.mu.Lock()
-	done, srv, addr := p.stopDone, p.srv, p.addr
+	done, srv, addr, cancel := p.stopDone, p.srv, p.addr, p.stopCancel
 	if done == nil {
 		p.mu.Unlock()
 		return nil
@@ -243,6 +256,7 @@ func (p *Proxy) Stop() error {
 	p.srv = nil
 	p.ln = nil
 	p.addr = ""
+	p.stopCtx, p.stopCancel = nil, nil
 	p.started.Store(false)
 	// The connections are collected here and closed after the lock is
 	// released: closing one runs trackedConn.Close, which takes this same lock
@@ -265,6 +279,13 @@ func (p *Proxy) Stop() error {
 	// cares, and stopping is a decision the user already made.
 	for _, c := range conns {
 		c.Close()
+	}
+	// An exchange blocked on a breakpoint is not waiting on its socket, so
+	// closing the connection does not reach it: cancelling the run's context
+	// does, and the handler returns instead of holding Shutdown for its full
+	// timeout.
+	if cancel != nil {
+		cancel()
 	}
 	for _, t := range transports {
 		t.CloseIdleConnections()
@@ -340,7 +361,14 @@ func (p *Proxy) Replay(ctx context.Context, req *msg.Request) error {
 		return err
 	}
 	ex.setTimings(times)
+	// A replay is not sent to a client, so the body it got belongs to nobody:
+	// close it rather than leave the origin's connection open. A stream holds
+	// the origin's socket, which would keep streaming for ever.
+	defer resp.Close()
 	if final, err := p.policy.Response(ctx, ex, resp); err == nil && final != nil {
+		if final != resp {
+			defer final.Close()
+		}
 		resp = final
 	}
 	ex.Response = resp
@@ -389,8 +417,11 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 // logf writes a diagnostic line when the proxy runs with a logger.
 func (p *Proxy) logf(format string, args ...any) {
-	if p.logger != nil {
-		p.logger.Printf(format, args...)
+	p.mu.Lock()
+	l := p.logger
+	p.mu.Unlock()
+	if l != nil {
+		l.Printf(format, args...)
 	}
 }
 
@@ -599,7 +630,217 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		r.URL.Scheme = scheme
 		r.URL.Host = r.Host
 	}
+	// An upgrade (WebSocket, and anything else carried on Connection: Upgrade)
+	// stops being HTTP once the origin answers 101, so it cannot go through the
+	// usual request/response capture: after the handshake the connection carries
+	// a protocol this proxy does not parse. It is captured as a session and then
+	// tunnelled byte for byte.
+	if httpx.IsUpgrade(r.Header) {
+		p.upgrade(w, r)
+		return
+	}
 	p.forward(w, r)
+}
+
+// upgrade records the handshake and then tunnels the connection.
+//
+// A request that asks to upgrade stops being HTTP once the origin answers 101:
+// after that the connection carries a protocol this proxy does not parse, so it
+// cannot go through the ordinary capture-and-forward path. The handshake is
+// recorded as a session — the request and the 101, which is what says the socket
+// exists and where it goes — and every byte after it is passed through.
+func (p *Proxy) upgrade(w http.ResponseWriter, r *http.Request) {
+	ex := &Exchange{Started: time.Now()}
+	req, overflow, err := captureRequest(r, p.tune.MaxBodyBytes)
+	if err != nil {
+		http.Error(w, "proxy: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer req.Close()
+	ex.Request = req
+	p.policy.Begin(ex)
+
+	decision, err := p.policy.Request(r.Context(), ex)
+	if err != nil {
+		p.policy.Complete(ex, nil, err)
+		http.Error(w, "proxy: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if decision.Abort || decision.Mock != nil {
+		resp := decision.Mock
+		if resp == nil {
+			resp = statusResponse(decision.Status)
+		}
+		p.finish(w, r, ex, resp, nil)
+		return
+	}
+
+	client, br, err := hijack(w)
+	if err != nil {
+		p.policy.Complete(ex, nil, err)
+		http.Error(w, "proxy: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer client.Close()
+
+	upstream, err := p.dialOrigin(r.Context(), req.URL)
+	if err != nil {
+		p.policy.Complete(ex, nil, err)
+		io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		return
+	}
+	defer upstream.Close()
+
+	if err := writeHandshake(upstream, req, overflow); err != nil {
+		p.policy.Complete(ex, nil, err)
+		io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		return
+	}
+
+	// The response head is read so the session can record it, then written back
+	// as the origin wrote it. Whatever follows the head belongs to the tunnelled
+	// protocol and is passed through untouched.
+	upstreamReader := bufio.NewReader(upstream)
+	raw, err := http.ReadResponse(upstreamReader, nil)
+	if err != nil {
+		p.policy.Complete(ex, nil, err)
+		io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		return
+	}
+	resp := &msg.Response{
+		Status:  raw.StatusCode,
+		Reason:  raw.Status,
+		Proto:   raw.Proto,
+		Message: msg.Message{Header: raw.Header},
+	}
+	ex.Response = resp
+
+	if raw.StatusCode != http.StatusSwitchingProtocols {
+		// The handshake was refused and this is an ordinary response: capture it
+		// and answer normally, so a rejected upgrade is recorded with its reason
+		// like any other exchange.
+		captured, _, cerr := captureResponse(raw, p.tune.MaxBodyBytes, time.Now())
+		if cerr == nil && captured != nil {
+			captured.Status, captured.Reason = resp.Status, resp.Reason
+			resp = captured
+			ex.Response = resp
+		}
+		p.policy.Complete(ex, resp, cerr)
+		writeResponse(w, r, resp)
+		return
+	}
+
+	if err := writeResponseHead(client, raw); err != nil {
+		p.policy.Complete(ex, resp, err)
+		return
+	}
+	p.policy.Complete(ex, resp, nil)
+
+	// The connection is now the upgraded protocol, both ways. Bytes the client
+	// sent after its handshake head, and bytes the origin buffered after its
+	// 101, are part of it.
+	var fromClient io.Reader = client
+	if br != nil {
+		fromClient = br
+	}
+	pipeBuffered(client, upstream, fromClient, upstreamReader)
+}
+
+// dialOrigin opens a connection to the origin named by u, with TLS when the URL
+// is an HTTPS one. The origin's certificate is not verified, as a debugging
+// proxy must not: see Tuning.UpstreamTLS.
+func (p *Proxy) dialOrigin(ctx context.Context, u *url.URL) (net.Conn, error) {
+	host := u.Host
+	if u.Port() == "" {
+		if u.Scheme == "https" {
+			host = net.JoinHostPort(u.Hostname(), "443")
+		} else {
+			host = net.JoinHostPort(u.Hostname(), "80")
+		}
+	}
+	conn, err := p.dialer.DialContext(ctx, "tcp", host)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "https" {
+		return conn, nil
+	}
+	cfg := p.tune.UpstreamTLS.Clone()
+	if cfg.ServerName == "" {
+		cfg.ServerName = u.Hostname()
+	}
+	tlsConn := tls.Client(conn, cfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+// writeHandshake writes a request to an origin in the form an origin expects:
+// the path in the request line, the host in Host, and the connection headers
+// kept, since an upgrade needs them to reach the origin.
+func writeHandshake(w io.Writer, req *msg.Request, body io.Reader) error {
+	target := "/"
+	if req.URL != nil {
+		target = req.URL.RequestURI()
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\n", req.Method, target)
+	fmt.Fprintf(&b, "Host: %s\r\n", req.URL.Host)
+	for k, vv := range req.Header {
+		switch {
+		case strings.EqualFold(k, "Host"), strings.EqualFold(k, "Content-Length"):
+			// Written above, or set from the body below.
+			continue
+		}
+		for _, v := range vv {
+			fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+		}
+	}
+	if len(req.Body) > 0 {
+		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(req.Body))
+	}
+	b.WriteString("\r\n")
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		return err
+	}
+	if len(req.Body) > 0 {
+		if _, err := w.Write(req.Body); err != nil {
+			return err
+		}
+	}
+	if body != nil {
+		if _, err := io.Copy(w, body); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeResponseHead forwards the origin's status line and headers as they were,
+// so an upgrade response reaches the client unchanged.
+func writeResponseHead(w io.Writer, raw *http.Response) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s\r\n", raw.Proto, raw.Status)
+	if err := raw.Header.Write(&b); err != nil {
+		return err
+	}
+	b.WriteString("\r\n")
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+// pipeBuffered copies both directions until either side is done, starting from
+// readers that may already hold bytes.
+func pipeBuffered(client, upstream net.Conn, fromClient io.Reader, fromOrigin io.Reader) {
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(upstream, fromClient); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(client, fromOrigin); done <- struct{}{} }()
+	<-done
+	client.SetReadDeadline(time.Now().Add(time.Second))
+	upstream.SetReadDeadline(time.Now().Add(time.Second))
+	<-done
 }
 
 // forward runs one exchange: capture, policy, origin, policy, response.
@@ -699,8 +940,10 @@ func (p *Proxy) roundTrip(ctx context.Context, req *msg.Request, overflow io.Rea
 	}
 
 	resp, ttfb, err := captureResponse(raw, p.tune.MaxBodyBytes, start)
-	// A captured body is read to the end, so its stream can be closed; a
-	// stream is passed to the client, which closes it by closing the response.
+	// A captured body is read to the end, so its stream is done with and can be
+	// closed; a stream is passed to the client, which closes it by closing the
+	// response. resp.Stream is set exactly when there are unread bytes left, so
+	// that is the test, not whether Body is empty.
 	if resp == nil || resp.Stream == nil {
 		defer raw.Body.Close()
 	}
@@ -736,8 +979,11 @@ func (p *Proxy) buildUpstreamRequest(ctx context.Context, req *msg.Request, over
 	// the session, which a GUI may be reading, and hop-by-hop headers have to
 	// be dropped from this copy alone.
 	outReq.Header = httpx.CloneWithoutHopHeaders(req.Header)
-	// The proxy speaks its own connection's negotiation to the origin.
-	outReq.Header.Del("Accept-Encoding")
+	// Accept-Encoding is left as the client sent it. The transport has
+	// compression off (see transportFor): it must not negotiate a coding of its
+	// own and decode it, because the body the origin sent has to reach the
+	// client exactly as the origin wrote it, and the capture decodes a copy for
+	// display.
 	if overflow != nil {
 		// The length is unknown once the body streams from two readers.
 		outReq.ContentLength = -1
@@ -785,28 +1031,35 @@ func (p *Proxy) transportFor(scheme string) *http.Transport {
 // A buffered body goes out in one write; a stream is copied as it arrives and
 // flushed at every chunk, since net/http would otherwise hold the response
 // headers until the stream ended, which for server-sent events is never.
+//
+// A body longer than the capture limit arrives as both: Body is the start that
+// was kept, and Stream is the rest that was never buffered. Both are written, so
+// the client gets the response the origin sent rather than the part the capture
+// happened to keep.
 func writeResponse(w http.ResponseWriter, r *http.Request, resp *msg.Response) {
 	h := w.Header()
 	httpx.CopyHeader(h, resp.Header)
 	httpx.RemoveHopHeaders(h)
-	if resp.Stream == nil && resp.Header.Get("Content-Length") != "" {
-		h.Set("Content-Length", strconv.Itoa(len(resp.Body)))
-	}
 	if resp.Stream != nil {
 		// The length is unknown, and announcing one would make the client
 		// wait for bytes that never come.
 		h.Del("Content-Length")
+	} else if resp.Header.Get("Content-Length") != "" {
+		h.Set("Content-Length", strconv.Itoa(len(resp.Body)))
 	}
 	w.WriteHeader(resp.Status)
 	if r.Method == http.MethodHead {
 		return
 	}
-	if resp.Stream != nil {
-		copyStream(w, resp.Stream)
-		return
-	}
 	if len(resp.Body) > 0 {
-		_, _ = w.Write(resp.Body)
+		if _, err := w.Write(resp.Body); err != nil {
+			resp.Close()
+			return
+		}
+	}
+	if resp.Stream != nil {
+		defer resp.Close()
+		copyStream(w, resp.Stream)
 	}
 }
 

@@ -1,11 +1,6 @@
 package api
 
-import (
-	"context"
-	"encoding/json"
-	"net/http"
-	"strconv"
-)
+import "net/http"
 
 // The proxy's own lifecycle is part of the control plane, not of the proxy.
 //
@@ -37,13 +32,6 @@ type ProxyController interface {
 	StartProxy(addr string) (string, error)
 	// StopProxy stops serving and releases the port.
 	StopProxy() error
-}
-
-// routes for the proxy's lifecycle, registered with the rest of the API.
-func (s *Server) proxyRoutes() {
-	s.mux.HandleFunc("GET /api/proxy", s.handleProxyStatus)
-	s.mux.HandleFunc("POST /api/proxy/start", s.handleProxyStart)
-	s.mux.HandleFunc("POST /api/proxy/stop", s.handleProxyStop)
 }
 
 // proxyJSON is how the API shows the proxy.
@@ -101,7 +89,3 @@ func (s *Server) handleProxyStop(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, proxyJSON{Running: false})
 }
-
-var _ = context.Background
-var _ = json.Marshal
-var _ = strconv.Itoa

@@ -14,6 +14,7 @@ import (
 
 	"github.com/jlvihv/qingqiuxia/internal/breakpoint"
 	"github.com/jlvihv/qingqiuxia/internal/mitm"
+	"github.com/jlvihv/qingqiuxia/internal/msg"
 	"github.com/jlvihv/qingqiuxia/internal/pipeline"
 	"github.com/jlvihv/qingqiuxia/internal/proxy"
 	"github.com/jlvihv/qingqiuxia/internal/rule"
@@ -319,8 +320,17 @@ func TestBreakpointEditsRequest(t *testing.T) {
 	if p.Phase != breakpoint.OnRequest {
 		t.Errorf("phase = %s", p.Phase)
 	}
-	// Edit the paused request as the API would, then release it.
-	p.Request.SetBody([]byte(`{"user":"edited"}`))
+	// Edit the paused request as the API would, then release it. The edit goes
+	// through the live pause, which is what holds the message the proxy
+	// continues with.
+	live, ok := s.pauses.Live(p.ID)
+	if !ok {
+		t.Fatal("the pause went away")
+	}
+	live.Edit(func(req *msg.Request, _ *msg.Response) error {
+		req.SetBody([]byte(`{"user":"edited"}`))
+		return nil
+	})
 	if !s.pauses.Resume(p.ID, breakpoint.Release) {
 		t.Fatal("resume failed")
 	}
@@ -333,7 +343,7 @@ func TestBreakpointEditsRequest(t *testing.T) {
 }
 
 // waitForPause waits for a message to be paused.
-func waitForPause(t *testing.T, m *breakpoint.Manager) (*breakpoint.Paused, bool) {
+func waitForPause(t *testing.T, m *breakpoint.Manager) (breakpoint.Snapshot, bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -342,7 +352,7 @@ func waitForPause(t *testing.T, m *breakpoint.Manager) (*breakpoint.Paused, bool
 		}
 		time.Sleep(time.Millisecond)
 	}
-	return nil, false
+	return breakpoint.Snapshot{}, false
 }
 
 // TestBreakpointEditsResponse checks the response side of a breakpoint.
@@ -374,7 +384,14 @@ func TestBreakpointEditsResponse(t *testing.T) {
 	if !ok {
 		t.Fatal("no breakpoint pause")
 	}
-	p.Response.SetBody([]byte("edited body"))
+	live, ok := s.pauses.Live(p.ID)
+	if !ok {
+		t.Fatal("the pause went away")
+	}
+	live.Edit(func(_ *msg.Request, resp *msg.Response) error {
+		resp.SetBody([]byte("edited body"))
+		return nil
+	})
 	s.pauses.Resume(p.ID, breakpoint.Release)
 
 	if body := <-got; body != "edited body" {
