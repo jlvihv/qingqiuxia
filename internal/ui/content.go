@@ -19,7 +19,16 @@ func (a *App) content(c *ui.Context, p *Palette) {
 }
 
 // paneAndDetail puts the chosen pane and the detail panel side by side.
+//
+// The detail panel belongs to the traffic list: it explains one captured
+// exchange. A rules table or a certificate has nothing for it to show, so in
+// those panes the chosen pane takes the whole width rather than standing beside
+// an inspector of something it is not about.
 func (a *App) paneAndDetail(c *ui.Context, p *Palette) {
+	if a.Section != SectionTraffic {
+		a.pane(c, p)
+		return
+	}
 	ui.Split(c, &a.MainWidth, func() {
 		a.pane(c, p)
 	}, func() {

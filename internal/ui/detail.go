@@ -51,30 +51,37 @@ func (a *App) detail(c *ui.Context, p *Palette) {
 // colour, and a dim line under a chosen tab reads as a disabled one.
 func (a *App) tabBar(c *ui.Context, p *Palette) {
 	tabs := ui.TabsBase(c, &a.Detail, len(detailTabs))
-	ui.Row(c).FillWidth().Padding(tokenSpace3, tokenSpace4, 0, 0).
-		Border(0, p.Border).Children(func() {
-		tabs.List.Gap(tokenSpace4).Children(func() {
-			for i, label := range detailTabs {
-				on := i == a.Detail
-				tab := tabs.Tab(i)
-				// The tab is a column: the label, then an underline of its own
-				// width. Every tab draws the bar, transparent when it is not the
-				// chosen one, so that choosing a tab does not shift the strip.
-				tab.Gap(tokenSpace1).Padding(tokenSpace2, 0, 0, 0).Shrink(0).Children(func() {
-					e := ui.Text(c, label).FontSize(tokenFontSmall).SingleLine()
-					if on {
-						e.TextColor(p.Text).Bold()
-					} else {
-						e.TextColor(p.TextMuted)
-					}
-					bar := p.Accent
-					if !on {
-						bar = ui.RGBA(0, 0, 0, 0)
-					}
-					ui.Row(c).Height(2).Radius(1).Width(underlineWidth(label)).Background(bar)
-				})
-			}
+	ui.Column(c).FillWidth().Children(func() {
+		ui.Row(c).FillWidth().Padding(tokenSpace3, tokenSpace4, 0, 0).Children(func() {
+			tabs.List.Gap(tokenSpace4).Children(func() {
+				for i, label := range detailTabs {
+					on := i == a.Detail
+					tab := tabs.Tab(i)
+					// A Tab is a row, so the underline cannot be a child of it: a
+					// second child would sit beside the label, not under it. It is
+					// drawn as an absolutely placed bar along the tab's bottom edge
+					// instead, which works whatever the tab lays out inside.
+					tab.Padding(tokenSpace2, 0).Children(func() {
+						e := ui.Text(c, label).FontSize(tokenFontSmall).SingleLine()
+						if on {
+							e.TextColor(p.Text).Bold()
+						} else {
+							e.TextColor(p.TextMuted)
+						}
+						bar := p.Accent
+						if !on {
+							bar = ui.RGBA(0, 0, 0, 0)
+						}
+						ui.Row(c).Absolute().Left(0).Right(0).Bottom(-tokenSpace2).
+							Height(2).Radius(1).Background(bar)
+					})
+				}
+			})
 		})
+		// A hairline under the strip, the way a macOS tab bar separates itself
+		// from the pane below. Without it the tabs float over the content, and the
+		// pane's first card reads as another row of the strip.
+		ui.Row(c).FillWidth().Height(1).Background(p.Border)
 	})
 }
 
@@ -316,20 +323,25 @@ func (a *App) timingPane(c *ui.Context, p *Palette, sess *Session) {
 func (a *App) statusBar(c *ui.Context, p *Palette) {
 	total, dropped := a.Store.Counts()
 	ui.Row(c).FillWidth().Height(tokenHeightStatus).PaddingX(tokenSpace4).Gap(tokenSpace4).
-		Background(p.Raised).Children(func() {
+		Background(p.Raised).AlignItems(ui.Center).Children(func() {
 		a.stat(c, p, "会话", fmt.Sprint(total), p.TextMuted)
 		a.stat(c, p, "丢弃", fmt.Sprint(dropped), p.Warning)
 		ui.Row(c).Grow(1)
-		a.stat(c, p, "核心", fmt.Sprintf("%d MB · %d 线程",
-			a.CoreMemoryMB, a.CoreThreads), p.Dim)
+		a.stat(c, p, "核心", fmt.Sprintf("%d MB · %d goroutine",
+			a.CoreMemoryMB, a.CoreGoroutines), p.Dim)
 		a.stat(c, p, "api", a.Version, p.Dim)
 	})
 }
 
 // stat is one pair of label and value in the status bar.
+//
+// The value is monospaced and right-aligned inside a fixed width, so that a
+// count going from 9 to 10 does not shift the label beside it, and the two
+// counts in the bar do not drift apart as traffic arrives.
 func (a *App) stat(c *ui.Context, p *Palette, label, value string, colour ui.Color) {
-	ui.Row(c).Gap(tokenSpace1).Children(func() {
+	ui.Row(c).Gap(tokenSpace1).AlignItems(ui.Center).Children(func() {
 		ui.Text(c, label).FontSize(tokenFontSmall).TextColor(p.Dim)
-		ui.Text(c, value).FontSize(tokenFontSmall).Font(monoFamily).TextColor(colour)
+		ui.Text(c, value).FontSize(tokenFontSmall).Font(monoFamily).
+			TextColor(colour).MinWidth(26).TextAlign(ui.End)
 	})
 }

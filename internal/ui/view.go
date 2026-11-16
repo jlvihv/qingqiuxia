@@ -56,8 +56,11 @@ type App struct {
 	Recording bool
 	// Version is the core's version, shown in the status bar.
 	Version string
-	// CoreMemoryMB and CoreThreads describe the core process.
-	CoreMemoryMB, CoreThreads int
+	// CoreMemoryMB and CoreGoroutines describe the core process. The second is
+	// its goroutine count, not its thread count: the API reports goroutines, and
+	// calling that "线程" in the status bar was a label that named a different
+	// number from the one it showed.
+	CoreMemoryMB, CoreGoroutines int
 	// PausedCount is how many messages the core holds at a breakpoint, and
 	// RuleCount how many rules are configured.
 	PausedCount, RuleCount int
@@ -178,7 +181,7 @@ func (a *App) SetCoreStatus(st Status) {
 	a.PausedCount = st.Paused
 	a.RuleCount = st.Rules
 	a.CoreMemoryMB = int(st.MemoryMB)
-	a.CoreThreads = st.Goroutines
+	a.CoreGoroutines = st.Goroutines
 	a.down = ""
 }
 
@@ -392,14 +395,25 @@ func (a *App) View(c *ui.Context) {
 func (a *App) toolbar(c *ui.Context, p *Palette) {
 	ui.Row(c).FillWidth().Height(tokenHeightToolbar).
 		Padding(tokenSpace2, tokenSpace4, tokenSpace2, tokenContentInset).
-		Gap(tokenSpace4).Background(p.Surface).AlignItems(ui.Center).Children(func() {
-		a.recordingSwitch(c, p)
-		a.proxyButton(c, p)
+		Background(p.Surface).AlignItems(ui.Center).Children(func() {
+		// Three groups, in the order a tool window puts them: the window's own
+		// state on the left, what narrows the pane beside it, and the switch
+		// between panes on the right. One growing spacer between the filter and
+		// the switch is what pushes the last group to the edge; two spacers put
+		// the filter in the middle, which is not where a search field belongs in
+		// a window whose left side is a list.
+		ui.Row(c).Gap(tokenSpace3).AlignItems(ui.Center).Shrink(0).Children(func() {
+			a.recordingSwitch(c, p)
+			a.proxyButton(c, p)
+		})
 		if a.Section == SectionTraffic {
+			ui.Row(c).Width(tokenSpace5).Height(1)
 			a.filterField(c, p)
 		}
-		ui.Row(c).Grow(1).Height(1) // the spacer that pushes the rest right
-		a.sectionControl(c, p)
+		ui.Row(c).Grow(1).Height(1)
+		ui.Row(c).Shrink(0).Children(func() {
+			a.sectionControl(c, p)
+		})
 	})
 }
 
@@ -410,7 +424,12 @@ func (a *App) toolbar(c *ui.Context, p *Palette) {
 // switch. A core that is not reachable, or a proxy that is not listening, cannot
 // record, so the switch is disabled and the words say why.
 func (a *App) recordingSwitch(c *ui.Context, p *Palette) {
-	on := a.Recording && a.down == "" && a.ProxyRunning
+	// The switch shows the core's own answer, not a value recomputed from the
+	// proxy's state: whether the core is capturing and whether anything is
+	// listening are two facts, and folding them together made a stopped proxy
+	// look like a core that had been switched off. The switch is disabled when
+	// there is nothing to record from, which is what "cannot" means.
+	live := a.down == "" && a.ProxyRunning
 	hint := ""
 	switch {
 	case a.down != "":
@@ -419,22 +438,22 @@ func (a *App) recordingSwitch(c *ui.Context, p *Palette) {
 		hint = "代理未启动"
 	}
 
-	ui.Row(c).Gap(tokenSpace2).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Gap(tokenSpace3).AlignItems(ui.Center).Children(func() {
 		ui.Text(c, "录制").FontSize(tokenFontUI).TextColor(p.TextMuted)
-		// The switch reports the state it was just set to, and the callback is
-		// what changes it: the value is written back from the core's answer on
-		// the next tick, so a failed toggle does not leave a lying switch.
+		on := a.Recording
 		wasOn := on
 		sw := ui.Switch(c, &on)
-		sw.Disabled(!a.ProxyRunning || a.down != "")
+		sw.Disabled(!live)
 		sw.Label("录制流量")
+		// The callback is what changes capture; the value comes back from the
+		// core on the next tick, so a toggle the core refused does not leave a
+		// switch that lies about it.
 		if on != wasOn && a.OnToggleCapture != nil {
 			a.OnToggleCapture(on)
 		}
-		// The reason it cannot record goes after the switch in the dimmest text
-		// level: it is an explanation, not a label, and it should read as a note
-		// beside the control rather than as a second title.
 		if hint != "" {
+			// A note, not a label: it explains the disabled switch, so it sits a
+			// gap away in the dimmest level rather than touching the control.
 			ui.Text(c, hint).FontSize(tokenFontMicro).TextColor(p.Dim).SingleLine()
 		}
 	})
@@ -531,13 +550,22 @@ func (a *App) sectionControl(c *ui.Context, p *Palette) {
 // pauseBanner appears only while a breakpoint holds a message: a modal would
 // hide the list the user needs to judge the decision by.
 func (a *App) pauseBanner(c *ui.Context, p *Palette) {
-	ui.Row(c).FillWidth().Height(34).PaddingX(tokenSpace4).Gap(tokenSpace3).
-		Background(ui.RGBA(0xf8, 0x51, 0x49, 0x1a)).Children(func() {
+	// The banner spans the window, above both panes: it is about one exchange,
+	// but the decision it asks for is the window's, and a banner inside the list
+	// would be pushed around by the list's own scrolling. Its right padding is
+	// the toolbar's, so the two buttons line up with the segmented control above
+	// them rather than sitting against the window edge.
+	ui.Row(c).FillWidth().Height(38).Padding(tokenSpace2, tokenSpace4).
+		Gap(tokenSpace3).AlignItems(ui.Center).
+		// The fill is a tint of the danger colour, not a wash: at 10% it read as
+		// empty space with two buttons in it, and a pause the user cannot see is
+		// a pause they miss. 22% is dark enough to stay behind the text and warm
+		// enough to register at a glance.
+		Background(ui.RGBA(0xf8, 0x51, 0x49, 0.16)).Children(func() {
 		ui.Text(c, "已暂停").Bold().FontSize(tokenFontBody).TextColor(p.Danger)
 		ui.Text(c, fmt.Sprintf("断点「%s」拦下了 %s %s",
 			a.Paused.RuleName, a.Paused.Method, a.Paused.URL)).
-			FontSize(12).SingleLine().TextColor(p.Text)
-		ui.Row(c).Grow(1)
+			FontSize(tokenFontBody).SingleLine().TextColor(p.Text).Grow(1)
 		pauseID := a.Paused.ID
 		if ui.Button(c, "中止").Clicked() && a.OnAbort != nil {
 			a.OnAbort(pauseID)
@@ -584,7 +612,7 @@ func (a *App) sidebar(c *ui.Context, p *Palette) {
 			a.sidebarItem(c, "section", sectionIcon(a.Section), a.Section.String(), a.sectionCount())
 		})
 	})
-	sb.Background(ui.RGBA(0x00, 0x00, 0x00, 0x00))
+	sb.Background(sidebarFill())
 
 	a.applySidebarChoice(sel, showTraffic)
 }

@@ -130,6 +130,15 @@ var Dark = Palette{
 	Danger:       ui.Hex("#f85149"),
 }
 
+// sidebarFill is what the source list paints behind its items.
+//
+// Nothing, when the window shows a material: macOS puts the sidebar material
+// behind a view that draws no background, and a fill — even a dark one — covers
+// the blur it was asked for. Where there is no material this transparents onto
+// the window's own background, which is the same colour the panel beside it
+// sits on.
+func sidebarFill() ui.Color { return ui.RGBA(0, 0, 0, 0) }
+
 // StatusColor is the colour a status code is written in: the family of the
 // code, which is what a reader scans for.
 func (p *Palette) StatusColor(status int) ui.Color {
@@ -197,19 +206,19 @@ func (p *Palette) Theme() ui.Theme {
 		// a table with one row in full blue is tiring to read, and the row's
 		// text has to stay legible on it.
 		Selection:       p.Selection,
-		Focus:           ui.RGBA(0x4c, 0x8d, 0xff, 0x99),
+		Focus:           ui.RGBA(0x4c, 0x8d, 0xff, 0.6),
 		FocusRingWidth:  2,
 		FocusRingOffset: 1,
 		// 滚动条要能被找到，但不能比内容还显眼。近黑背景上，白 12% 的 thumb 是
 		// #2a2a2a 一类的亮度，跟面板几乎分不开，却又在静止时一直跳出来；降到 8%
 		// 之后它只在需要时被注意到，鼠标移上去才亮起来。轨道不画：一条贯穿整列
 		// 的浅色竖条，是列表里最抢视线的东西。
-		Scrollbar:      ui.RGBA(0xff, 0xff, 0xff, 0x14),
+		Scrollbar:      ui.RGBA(0xff, 0xff, 0xff, 0.08),
 		ScrollbarWidth: 6,
 		ScrollbarStyle: ui.ScrollbarStyle{
-			Thumb:  ui.RGBA(0xff, 0xff, 0xff, 0x14),
-			Hover:  ui.RGBA(0xff, 0xff, 0xff, 0x28),
-			Active: ui.RGBA(0xff, 0xff, 0xff, 0x3d),
+			Thumb:  ui.RGBA(0xff, 0xff, 0xff, 0.08),
+			Hover:  ui.RGBA(0xff, 0xff, 0xff, 0.16),
+			Active: ui.RGBA(0xff, 0xff, 0xff, 0.24),
 			Track:  ui.RGBA(0, 0, 0, 0),
 		},
 		// The radii and spacing the framework's widgets use, from the same

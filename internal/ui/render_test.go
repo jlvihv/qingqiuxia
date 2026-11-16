@@ -25,7 +25,7 @@ func TestRenderLayout(t *testing.T) {
 	app.CAInstalled = true
 	app.Version = "0.1.0"
 	app.CoreMemoryMB = 118
-	app.CoreThreads = 3
+	app.CoreGoroutines = 3
 	app.Selected = 1
 
 	img := ui.Render(app.View, 1440, 900, 1)

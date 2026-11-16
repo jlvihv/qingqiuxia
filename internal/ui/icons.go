@@ -17,7 +17,7 @@ var (
 	iconRule    = icon("M2.5 12.5 6 3.5M8.5 12.5 12 3.5M4 8h8", "")
 	iconPause   = icon("M6 3.5v9M10 3.5v9", "")
 	iconCert    = icon("M8 2.5 3.5 5v4c0 2.8 1.9 4.6 4.5 5.5 2.6-.9 4.5-2.7 4.5-5.5V5L8 2.5Z", "")
-	iconProxy   = icon("M2.5 5.5h11M2.5 10.5h11M5.5 3 3 5.5 5.5 8M10.5 8l2.5 2.5L10.5 13", "")
+	iconProxy   = icon("M6 2.5v3M10 2.5v3M4.5 5.5h7v2a3.5 3.5 0 0 1-7 0v-2ZM8 11v2.5", "")
 	iconFilter  = icon("M2.5 3.5h11l-4.2 5.2v4.1l-2.6 1.3V8.7L2.5 3.5Z", "")
 	iconChevron = icon("M6 4l4 4-4 4", "")
 	iconRecord  = icon("M8 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z", "fill")
