@@ -21,6 +21,10 @@ var (
 	iconFilter  = icon("M2.5 3.5h11l-4.2 5.2v4.1l-2.6 1.3V8.7L2.5 3.5Z", "")
 	iconChevron = icon("M6 4l4 4-4 4", "")
 	iconRecord  = icon("M8 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z", "fill")
+	// A spark, for the prompt handed to an assistant. It is the glyph the
+	// assistant features of the platform's own apps use, so it reads without a
+	// label once the button has been pressed once.
+	iconSpark = icon("M8 2.5 9.6 6.4 13.5 8 9.6 9.6 8 13.5 6.4 9.6 2.5 8 6.4 6.4 8 2.5Z", "")
 )
 
 // icon wraps SVG path data in a minimal 16×16 document.

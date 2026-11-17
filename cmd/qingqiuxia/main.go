@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/transfer"
 	"github.com/egoist/mygo/ui"
 
 	"github.com/jlvihv/qingqiuxia/internal/api"
@@ -119,7 +120,7 @@ type config struct {
 func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.proxyAddr, "proxy", "", "address the proxy listens on; empty starts with the proxy stopped, and the window offers a port")
-	flag.StringVar(&cfg.apiAddr, "api", "127.0.0.1:8898", "address the control API listens on, when -headless")
+	flag.StringVar(&cfg.apiAddr, "api", "127.0.0.1:8898", "address the control API listens on (it runs in window mode too)")
 	flag.StringVar(&cfg.dataDir, "data", defaultDataDir(), "directory for the certificate authority and saved rules")
 	flag.StringVar(&cfg.token, "token", "", "API token; empty means no token, which is only safe on loopback or a socket")
 	flag.Int64Var(&cfg.maxBody, "max-body", proxy.DefaultMaxBodyBytes, "how much of a body to keep for inspection, in bytes")
@@ -267,6 +268,9 @@ func (c *core) log() {
 		log.Printf("proxy   stopped; start it from the window or POST /api/proxy/start")
 	}
 	log.Printf("control http://%s/api/status  (the tool's API, not the proxy)", c.server.Addr())
+	// The index is written for an assistant reading with curl, and it is the
+	// first thing anyone pointing a tool at this core should read.
+	log.Printf("for AI  http://%s/api  (plain text: what it can do, what each call costs)", c.server.Addr())
 	log.Printf("ca      %s", filepath.Join(c.cfg.dataDir, "ca.crt"))
 	log.Printf("install the CA certificate in your client to see HTTPS traffic")
 }
@@ -340,6 +344,29 @@ func (c *core) serveWithWindow() error {
 				win.Invalidate()
 			}
 		})
+	}
+
+	// The control API is a TCP listener, so the window can tell a user — and the
+	// assistant they are about to copy a prompt into — the address it answers on.
+	if addr := c.server.Addr(); addr != "" {
+		app.APIAddr = "http://" + addr
+	}
+	app.OnCopyPrompt = func(text string) {
+		go func() {
+			err := mygo.Clipboard.Write(transfer.TextData(text))
+			mygo.RunOnMain(func() {
+				app.PromptCopied = err == nil
+				invalidate()
+				// The label goes back to what it was: "已复制" is a confirmation,
+				// not a state the button stays in.
+				time.AfterFunc(2*time.Second, func() {
+					mygo.RunOnMain(func() {
+						app.PromptCopied = false
+						invalidate()
+					})
+				})
+			})
+		}()
 	}
 	app.OnToggleCapture = func(on bool) {
 		go func() {

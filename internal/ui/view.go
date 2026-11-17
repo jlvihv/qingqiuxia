@@ -30,6 +30,17 @@ type App struct {
 	HostsOpen bool
 	// ProxyOpen is whether the proxy's popover is showing.
 	ProxyOpen bool
+	// APIAddr is where the control API listens, which the prompt for an AI
+	// tells it to read. Empty while the core has not said.
+	APIAddr string
+	// PromptCopied is set for a moment after the prompt was copied, so the
+	// button can say it worked. A copy that says nothing leaves a user pressing
+	// it again to check.
+	PromptCopied bool
+	// OnCopyPrompt copies the prompt for an AI. The command sets it, because
+	// the clipboard is the window's, not the view's: a view that reached for
+	// it would tie itself to one platform.
+	OnCopyPrompt func(text string)
 
 	// Selected is the row the user chose, -1 for none.
 	Selected int
@@ -411,10 +422,45 @@ func (a *App) toolbar(c *ui.Context, p *Palette) {
 			a.filterField(c, p)
 		}
 		ui.Row(c).Grow(1).Height(1)
-		ui.Row(c).Shrink(0).Children(func() {
+		ui.Row(c).Gap(tokenSpace3).AlignItems(ui.Center).Shrink(0).Children(func() {
+			a.promptButton(c, p)
 			a.sectionControl(c, p)
 		})
 	})
+}
+
+// promptButton copies a prompt for an AI assistant to the clipboard.
+//
+// This window is a debugging tool whose most common client is an assistant
+// reading the API with curl: the user has the traffic on screen, and an assistant
+// elsewhere that has no idea this core exists. One click gives it the address and
+// the one page it should read first — the API's index is written for that reader
+// and is generated from the running core, so the prompt only has to point at it.
+//
+// The label changes for a moment after a copy. A button that gives no sign it
+// worked leaves the user pressing it a second time to find out.
+func (a *App) promptButton(c *ui.Context, p *Palette) {
+	if a.APIAddr == "" {
+		// The core has not said where its API is yet, and a prompt with an empty
+		// address is worse than no button: it is a wrong address an assistant
+		// would confidently use.
+		return
+	}
+	label := "给 AI"
+	colour := p.TextMuted
+	if a.PromptCopied {
+		label = "已复制"
+		colour = p.Success
+	}
+	btn := ui.ButtonBase(c).Label("复制给 AI 的提示词")
+	btn.Height(28).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusControl).
+		Background(p.Raised).Children(func() {
+		ui.Icon(c, iconSpark).Width(13).Height(13).TextColor(colour)
+		ui.Text(c, label).FontSize(tokenFontBody).TextColor(colour).SingleLine()
+	})
+	if btn.Clicked() && a.OnCopyPrompt != nil {
+		a.OnCopyPrompt(promptText(a.APIAddr))
+	}
 }
 
 // recordingSwitch says whether the core is capturing and turns it on or off.
