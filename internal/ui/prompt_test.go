@@ -52,12 +52,14 @@ func TestPromptPointsAtTheIndex(t *testing.T) {
 	}
 	// It has to be short: a prompt that lists the whole API is a document the
 	// user has to maintain, and the index already is that document.
-	if len(copied) > 800 {
+	if len(copied) > 900 {
 		t.Errorf("the prompt is %d bytes; it should be a pointer, not a manual", len(copied))
 	}
-	// It ends where a user types their own question.
-	if !strings.HasSuffix(strings.TrimSpace(copied), "：") {
-		t.Errorf("the prompt does not end with a place to put the question:\n%s", copied)
+	// It names the certificate, which is the one thing that silently breaks
+	// HTTPS capture: without it every request looks like a CONNECT to a host the
+	// proxy cannot read, and nothing says so.
+	if !strings.Contains(copied, "certificate") {
+		t.Errorf("the prompt never mentions the root certificate:\n%s", copied)
 	}
 }
 

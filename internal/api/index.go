@@ -121,6 +121,21 @@ replace-body、set-status、redirect。
   代理和这个控制接口是两个不同的监听。代理是给被调试的客户端连的，这个接口
   是给工具连的。代理可以停掉，这个接口照样回答。
 
+== 证书：不解密 HTTPS 就看不到什么 ==
+
+  curl -s -O -J '{{BASE}}/api/certificate?download=1'   下载根证书（PEM）
+
+抓到的 HTTPS 只是一个 CONNECT 隧道，里面是密文 —— 方法、URL、头、body 全都
+看不到，除非被调试的客户端信任这个根证书。装进系统信任库，或者让 curl 用：
+
+  curl --cacert ca.crt --proxy http://127.0.0.1:8899 https://example.com/
+
+这是 HTTPS 抓不到东西最常见的原因，而且不会报错：不信任证书的客户端照样能上
+网，只是流量从代理旁边走过去了，列表里只留下一条 CONNECT。
+
+带 ?download=1 回的是 PEM 文件本身；不带时回 JSON（pem 和 pemBase64），给要在
+界面上显示指纹的程序用。
+
 == 持续观察，而不是反复问 ==
 
   curl -sN {{BASE}}/api/events
