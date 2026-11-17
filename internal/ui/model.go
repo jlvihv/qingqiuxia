@@ -360,7 +360,6 @@ func (s *Store) Hosts() []HostCount {
 type Status struct {
 	Version   string
 	ProxyAddr string
-	Capturing bool
 	Sessions  int
 	Rules     int
 	Paused    int

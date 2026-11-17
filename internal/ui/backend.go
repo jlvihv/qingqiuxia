@@ -24,8 +24,6 @@ type Backend interface {
 	// Detail returns one session's request and response bodies and headers,
 	// which Sessions deliberately left out.
 	Detail(ctx context.Context, id uint64) (Detail, error)
-	// SetCapture turns recording on or off.
-	SetCapture(ctx context.Context, on bool) error
 	// Pauses lists what is waiting at a breakpoint.
 	Pauses(ctx context.Context) ([]Pause, error)
 	// Resume releases a paused message, or refuses it.

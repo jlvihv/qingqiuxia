@@ -19,61 +19,6 @@ func newTesterWith(t *testing.T, adjust func(*qqx.App), urls ...string) (*qqx.Ap
 	return app, ui.NewTester(app.View, 1200, 700)
 }
 
-// TestRecordingToggleCallsBack checks that the recording switch reports what it
-// was set to: a click asks for capture to be turned off, and a click back asks
-// for it to be turned on.
-func TestRecordingToggleCallsBack(t *testing.T) {
-	var calls []bool
-	app, tt := newTesterWith(t, func(a *qqx.App) {
-		a.OnToggleCapture = func(on bool) { calls = append(calls, on) }
-		// The switch is live only while the proxy listens, so the test starts it.
-		a.SetProxyRunning("127.0.0.1:8899")
-	}, "https://api.test/v1/x")
-
-	// The switch's label is what a screen reader announces and what a test
-	// clicks; the click itself flips the value the framework writes.
-	if err := tt.Click("录制流量"); err != nil {
-		t.Fatalf("click the recording switch: %v", err)
-	}
-	tt.Frame()
-	if len(calls) != 1 || calls[0] != false {
-		t.Fatalf("calls = %v, want [false]", calls)
-	}
-
-	app.Recording = false
-	tt.Frame()
-	if err := tt.Click("录制流量"); err != nil {
-		t.Fatalf("click again: %v", err)
-	}
-	tt.Frame()
-	if len(calls) != 2 || calls[1] != true {
-		t.Errorf("calls = %v, want [false true]", calls)
-	}
-}
-
-// TestUnreachableCoreCannotToggle checks that the switch does nothing when the
-// core is not reachable: the light already says so, and an action that cannot
-// land must not pretend to.
-func TestUnreachableCoreCannotToggle(t *testing.T) {
-	called := false
-	app, tt := newTesterWith(t, func(a *qqx.App) {
-		a.OnToggleCapture = func(bool) { called = true }
-	})
-	app.SetCoreDown(errTest{})
-	tt.Frame()
-
-	if tt.HasText("录制中") {
-		t.Error("an unreachable core still shows a recording light")
-	}
-	if err := tt.Click("停止录制"); err == nil {
-		t.Errorf("the label should be the disabled one, not the action")
-	}
-	tt.Frame()
-	if called {
-		t.Error("a click on an unreachable core asked to toggle capture")
-	}
-}
-
 // TestPauseBannerResumes checks the banner: it shows what stopped and where,
 // and its buttons ask for the decision.
 func TestPauseBannerResumes(t *testing.T) {

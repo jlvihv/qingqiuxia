@@ -52,7 +52,7 @@ var routes = []route{
 	{
 		Group: "状态", Method: "GET", Path: "/api/status",
 		Summary: "它跑着吗、在录吗、代理在哪、攒了多少会话",
-		Returns: "{version, proxyAddr, capturing, sessions, rules, paused, memoryMb, goroutines}",
+		Returns: "{version, proxyAddr, sessions, rules, paused, memoryMb, goroutines}",
 		Handler: "handleStatus",
 	},
 	{
@@ -73,13 +73,6 @@ var routes = []route{
 		Summary: "停掉代理，释放端口",
 		Returns: "{running:false}",
 		Handler: "handleProxyStop",
-	},
-	{
-		Group: "状态", Method: "POST", Path: "/api/capture",
-		Summary: "开/关录制：关掉后代理照常转发，只是不再记录新会话",
-		Body:    `{"enabled":true|false}`,
-		Returns: "{capturing}",
-		Handler: "handleCapture",
 	},
 	{
 		Group: "状态", Method: "GET", Path: "/api/certificate",
@@ -259,7 +252,6 @@ func (s *Server) register() {
 func (s *Server) handlers() map[string]http.HandlerFunc {
 	return map[string]http.HandlerFunc{
 		"handleStatus":             s.handleStatus,
-		"handleCapture":            s.handleCapture,
 		"handleCertificate":        s.handleCertificate,
 		"handleListSessions":       s.handleListSessions,
 		"handleGetSession":         s.handleGetSession,

@@ -34,14 +34,10 @@ type Core struct {
 	Pipeline *pipeline.Pipeline
 	// Addr is where the proxy listens, for the GUI to show.
 	Addr func() string
-	// SetCapture turns capture on or off.
-	SetCapture func(bool)
 	// RulesChanged is called after a rule is added, changed or removed, so the
 	// core can write them down before the process ends: a rule someone spent
 	// five minutes writing should not go away because the window crashed.
 	RulesChanged func(specs []rule.Spec)
-	// CaptureOn reports whether capture is on.
-	CaptureOn func() bool
 	// Version is the core's version, for the status call.
 	Version string
 	// Started is when the core started.
@@ -191,7 +187,6 @@ type status struct {
 	// not understand.
 	APIVersion int    `json:"apiVersion"`
 	Uptime     string `json:"uptime"`
-	Capturing  bool   `json:"capturing"`
 	Sessions   int    `json:"sessions"`
 	Rules      int    `json:"rules"`
 	Breakpoint bool   `json:"breakpointEnabled"`
@@ -218,9 +213,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.core.Addr != nil {
 		st.ProxyAddr = s.core.Addr()
-	}
-	if s.core.CaptureOn != nil {
-		st.Capturing = s.core.CaptureOn()
 	}
 	if s.core.Resources != nil {
 		st.MemoryMB, st.Goroutines = s.core.Resources()
@@ -607,27 +599,6 @@ func truncateBodies(m *messageJSON, n int) {
 func (s *Server) handleClearSessions(w http.ResponseWriter, r *http.Request) {
 	n := s.core.Pipeline.Sessions().Clear()
 	writeJSON(w, http.StatusOK, map[string]int{"cleared": n})
-}
-
-func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Enabled *bool `json:"enabled"`
-	}
-	if !decode(w, r, &body) {
-		return
-	}
-	if body.Enabled == nil {
-		writeError(w, http.StatusBadRequest, "enabled is required")
-		return
-	}
-	if s.core.SetCapture != nil {
-		s.core.SetCapture(*body.Enabled)
-	}
-	on := false
-	if s.core.CaptureOn != nil {
-		on = s.core.CaptureOn()
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"capturing": on})
 }
 
 // sessionID parses the {id} path segment.

@@ -91,7 +91,7 @@ func TestLocalSessionsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Sessions != 1 || !st.Capturing || st.Version != "test" {
+	if st.Sessions != 1 || st.Version != "test" {
 		t.Errorf("status = %+v", st)
 	}
 }

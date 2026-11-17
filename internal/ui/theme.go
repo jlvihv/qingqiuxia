@@ -40,6 +40,11 @@ const (
 	tokenRadiusBadge   float32 = 3
 	tokenRadiusControl float32 = 5
 	tokenRadiusCard    float32 = 6
+	// tokenRadiusCapsule is a toolbar control's radius: half of its 28-DIP
+	// height, which makes it the capsule macOS 26 draws in a toolbar. The
+	// older radius is kept for the controls in a panel, where a capsule beside
+	// a rounded input reads as two styles on one surface.
+	tokenRadiusCapsule float32 = 14
 
 	// Spacing steps, in DIPs. The window uses these and nothing in between.
 	tokenSpace1 float32 = 4
@@ -47,15 +52,6 @@ const (
 	tokenSpace3 float32 = 10
 	tokenSpace4 float32 = 14
 	tokenSpace5 float32 = 20
-
-	// tokenTrafficLightInset is how far the window's close button sits from the
-	// window's left edge when the title bar is hidden, and tokenContentInset the
-	// room the sidebar leaves for it: macOS puts the traffic lights inside the
-	// content, so the first row of a sidebar starts below and to the right of
-	// them. The value is what TitleBarHiddenInset uses by default, plus a little
-	// so that a sidebar item's own padding lines up with the buttons.
-	tokenTrafficLightInset float32 = 20
-	tokenContentInset      float32 = 46
 
 	// Type sizes. Data is always monospaced, chrome never is.
 	tokenFontMicro float32 = 9.5  // a badge
@@ -130,6 +126,125 @@ var Dark = Palette{
 	Danger:       ui.Hex("#f85149"),
 }
 
+// The fills over the window's material.
+//
+// macOS draws Liquid Glass behind a window (mygo.VibrancyGlass), and it shows
+// wherever the view paints nothing. Three rules follow, and every surface obeys
+// one of them:
+//
+//   - A bar paints nothing at all (barFill). The material is the bar's surface;
+//     a tint of its own would hide the thing it was asked for.
+//   - A control on a bar is a smaller pane of the same glass: a little white,
+//     more under the pointer, with a hairline (capsuleFill, capsuleBorder).
+//   - A content pane darkens the glass (paneFill) so that a table of data stays
+//     readable over whatever the window is in front of, without becoming an
+//     opaque slab that ends the glass at its edge.
+//
+// Without a material — another platform, or Reduce Transparency — each returns
+// the theme's own surface, and the window is the flat one it always was.
+
+// contentAlpha is how much of a content pane's own colour is kept over the
+// material. High enough that light text on it clears the glass under it on a
+// bright desktop, low enough that the pane still reads as a pane of it.
+const contentAlpha float32 = 0.58
+
+// smokeAlpha is how much of the window's own colour sits over the material
+// before anything is drawn on it.
+//
+// The interface has one palette, and it is dark. On a window that shows the
+// material, leaving the whole ground clear makes light text sit on whatever
+// happens to be behind the window — an editor with a white page, say — and the
+// muted levels stop being readable. A smoke of the window's own colour keeps
+// the glass, which is still more than half of what the eye sees, and gives the
+// text the dark ground the palette was drawn for.
+const smokeAlpha float32 = 0.40
+
+// panelAlpha is how opaque a floating panel over the material is: a popover, a
+// menu hung under a button. Higher than a content pane's: the system draws the
+// popover's material over whatever is behind the window, and over a bright
+// desktop that material is bright enough to swallow light text. Most of the
+// window's own colour leaves the frost of the material at the edges and gives
+// the text its ground.
+const panelAlpha float32 = 0.80
+
+// panelFill is a floating panel's ground over the material: its colour,
+// translucent, or the colour itself where there is no material.
+func panelFill(c ui.Color, vibrancy bool) ui.Color {
+	if !vibrancy {
+		return c
+	}
+	return ui.RGBA(c.R, c.G, c.B, panelAlpha)
+}
+
+// windowFill is the window's ground: its colour without a material, and that
+// colour as a smoke over the material with one.
+func windowFill(c ui.Color, vibrancy bool) ui.Color {
+	if !vibrancy {
+		return c
+	}
+	return ui.RGBA(c.R, c.G, c.B, smokeAlpha)
+}
+
+// barFill is a bar's background: its colour without a material, and nothing
+// with one.
+func barFill(c ui.Color, vibrancy bool) ui.Color {
+	if !vibrancy {
+		return c
+	}
+	return ui.Transparent
+}
+
+// paneFill is a content pane's background: its colour, translucent over the
+// material.
+func paneFill(c ui.Color, vibrancy bool) ui.Color {
+	if !vibrancy {
+		return c
+	}
+	return ui.RGBA(c.R, c.G, c.B, contentAlpha)
+}
+
+// raisedFill is what reads as raised over the material: white at 12%, the fill
+// of the chosen segment of a switch and of a pill that stands out from the bar.
+// The theme's surface cannot do that on its own: over glass it lands as another
+// opaque chip rather than as a smaller pane of the same light.
+func raisedFill(p *Palette, vibrancy bool) ui.Color {
+	if !vibrancy {
+		return p.Pressed
+	}
+	return ui.RGBA(0xff, 0xff, 0xff, 0.12)
+}
+
+// capsuleFill is the face of a control on a bar: glass at rest, a little
+// brighter under the pointer and brighter still while pressed. Without a
+// material it is the theme's control face.
+func capsuleFill(p *Palette, vibrancy, hovered, pressed bool) ui.Color {
+	if !vibrancy {
+		switch {
+		case pressed:
+			return p.Pressed
+		case hovered:
+			return p.Hover
+		}
+		return p.Raised
+	}
+	switch {
+	case pressed:
+		return ui.RGBA(0xff, 0xff, 0xff, 0.22)
+	case hovered:
+		return ui.RGBA(0xff, 0xff, 0xff, 0.16)
+	}
+	return ui.RGBA(0xff, 0xff, 0xff, 0.10)
+}
+
+// capsuleBorder is the hairline a capsule of glass is outlined with: the light
+// that catches its edge, not a border dark enough to read as a rule.
+func capsuleBorder(p *Palette, vibrancy bool) ui.Color {
+	if !vibrancy {
+		return p.Border
+	}
+	return ui.RGBA(0xff, 0xff, 0xff, 0.14)
+}
+
 // sidebarFill is what the source list paints behind its items.
 //
 // Nothing, when the window shows a material: macOS puts the sidebar material
@@ -189,11 +304,11 @@ func (p *Palette) Theme() ui.Theme {
 		Border:         p.Border,
 		Text:           p.Text,
 		TextMuted:      p.TextMuted,
-		// The framework fills a chosen row, a checked box and a primary button
-		// with Accent. A row in full-strength blue is tiring in a log read for
-		// hours, so the theme's accent is the subdued selection colour; the
-		// brighter accent is this window's own, for a primary button and the
-		// line under a chosen tab.
+		// The framework fills a chosen row and a primary button with Accent. A
+		// row in full-strength blue is tiring in a log read for hours, so the
+		// window's accent is the subdued selection colour; a source list speaks
+		// for itself with the brighter one (see App.sidebar), because its icons
+		// are navigation and have to be read at a glance.
 		Accent:         p.Selection,
 		AccentHover:    ui.Hex("#2a4c85"),
 		AccentPressed:  ui.Hex("#16294d"),

@@ -25,14 +25,11 @@ func (a *App) SetProxyRunning(addr string) {
 	a.PortAddr = addr
 	a.ProxyAddr = addr
 	a.PortError = ""
-	// The proxy's popover was open to choose the port, and the port is now
-	// chosen: nothing left in it to read.
-	a.ProxyOpen = false
 }
 
-// SetProxyStopped records that nothing is listening: the port field goes back
-// to being editable, holding the last address so that restarting on the same
-// port is one click rather than retyping it, which is what a user who just
+// SetProxyStopped records that nothing is listening: the panel goes back to
+// being the port editor, holding the last address so that restarting on the
+// same port is one click rather than retyping it, which is what a user who just
 // stopped to change something else expects.
 func (a *App) SetProxyStopped() {
 	if a.PortText == "" && a.PortAddr != "" {
@@ -43,8 +40,8 @@ func (a *App) SetProxyStopped() {
 	a.PortError = ""
 }
 
-// SetProxyError records why the proxy could not start, which the toolbar shows
-// beside the field the user typed in.
+// SetProxyError records why the proxy could not start: the button says it
+// failed, and its panel opens on the reason and the field to fix it.
 func (a *App) SetProxyError(err error) {
 	a.ProxyRunning = false
 	a.PortError = err.Error()

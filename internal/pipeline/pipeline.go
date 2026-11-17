@@ -11,7 +11,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"github.com/jlvihv/qingqiuxia/internal/breakpoint"
@@ -62,8 +61,6 @@ type Pipeline struct {
 	// sessions maps an exchange to the session it records into. The proxy
 	// hands the exchange back unchanged, so the ID lives here rather than in
 	// the exchange, which keeps the proxy's type free of the store's.
-	// recording reports whether new exchanges are recorded.
-	recording atomic.Bool
 }
 
 // New returns a pipeline with the given options.
@@ -81,16 +78,8 @@ func New(opts Options) *Pipeline {
 	if p.sessions == nil {
 		p.sessions = session.NewStore(0)
 	}
-	p.recording.Store(true)
 	return p
 }
-
-// SetRecording turns recording of new exchanges on or off. Traffic keeps
-// flowing either way; only the session store stops filling.
-func (p *Pipeline) SetRecording(on bool) { p.recording.Store(on) }
-
-// Recording reports whether new exchanges are recorded.
-func (p *Pipeline) Recording() bool { return p.recording.Load() }
 
 // Rules returns the rule engine.
 func (p *Pipeline) Rules() *rule.Engine { return p.rules }
@@ -120,9 +109,6 @@ func (p *Pipeline) Certificate(host string) (*tls.Certificate, error) {
 // Begin records the start of an exchange, publishing the new session so a GUI
 // shows the row while the request is still in flight.
 func (p *Pipeline) Begin(ex *proxy.Exchange) {
-	if !p.recording.Load() {
-		return
-	}
 	sess := p.sessions.Begin(ex.Request, ex.Started)
 	ex.ID = sess.ID
 	// The exchange carries the session, so Request, Response and Complete need

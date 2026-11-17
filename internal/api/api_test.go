@@ -66,11 +66,10 @@ func newServerWith(t *testing.T, opts api.Options, adjust func(*api.Core)) *test
 	})
 	ts := &testServer{pipeline: pol, rules: rules, pauses: pauses, sessions: sessions}
 	core := api.Core{
-		Pipeline:  pol,
-		Version:   "test",
-		Started:   time.Now(),
-		Addr:      func() string { return "127.0.0.1:1234" },
-		CaptureOn: pol.Recording,
+		Pipeline: pol,
+		Version:  "test",
+		Started:  time.Now(),
+		Addr:     func() string { return "127.0.0.1:1234" },
 	}
 	if adjust != nil {
 		adjust(&core)
@@ -126,35 +125,6 @@ func TestStatus(t *testing.T) {
 	}
 	if st.Version != "test" || st.ProxyAddr != "127.0.0.1:1234" || st.APIVer != api.APIVersion {
 		t.Errorf("status = %+v", st)
-	}
-}
-
-// TestCaptureToggle checks that turning capture off is reported by the status
-// and stops recording, which a GUI shows as a switch.
-func TestCaptureToggle(t *testing.T) {
-	recording := true
-	ts := newServerWith(t, api.Options{}, func(c *api.Core) {
-		c.CaptureOn = func() bool { return recording }
-		c.SetCapture = func(on bool) { recording = on }
-	})
-
-	var st struct {
-		Capturing bool `json:"capturing"`
-	}
-	ts.do(t, "GET", "/api/status", nil, &st)
-	if !st.Capturing {
-		t.Error("capture should start on")
-	}
-	ts.do(t, "POST", "/api/capture", map[string]any{"enabled": false}, &st)
-	if st.Capturing {
-		t.Error("the response still says capturing")
-	}
-	if recording {
-		t.Error("the core was not told to stop")
-	}
-	ts.do(t, "GET", "/api/status", nil, &st)
-	if st.Capturing {
-		t.Error("the status still says capturing")
 	}
 }
 

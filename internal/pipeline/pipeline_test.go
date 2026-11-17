@@ -76,24 +76,6 @@ func TestFullExchange(t *testing.T) {
 	}
 }
 
-func TestRecordingOff(t *testing.T) {
-	p, _, sessions, _ := newPipeline(t)
-	p.SetRecording(false)
-	ex := &proxy.Exchange{Started: time.Now(), Request: request(t, "https://x.test/")}
-	p.Begin(ex)
-	if sessions.Len() != 0 {
-		t.Error("a session was recorded while recording was off")
-	}
-	if ex.ID != 0 {
-		t.Errorf("id = %d", ex.ID)
-	}
-	// The rest of the pipeline must cope with an unrecorded exchange.
-	if _, err := p.Request(context.Background(), ex); err != nil {
-		t.Fatal(err)
-	}
-	p.Complete(ex, &msg.Response{Status: 200}, nil)
-}
-
 func TestRuleFailureIsNotFatal(t *testing.T) {
 	p, rules, sessions, _ := newPipeline(t)
 	// A rule whose action fails at run time: a set-url with an unparseable URL

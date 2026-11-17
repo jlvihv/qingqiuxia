@@ -28,8 +28,10 @@ type App struct {
 	SidebarSelection string
 	// HostsOpen is whether the sidebar's host section is expanded.
 	HostsOpen bool
-	// ProxyOpen is whether the proxy's popover is showing.
-	ProxyOpen bool
+	// proxyAnchor is where the proxy button was drawn last frame, so the
+	// command can hang the button's panel under it: the panel is a window of
+	// the system's (an NSPopover on macOS), which only the command can make.
+	proxyAnchor ui.Rect
 	// APIAddr is where the control API listens, which the prompt for an AI
 	// tells it to read. Empty while the core has not said.
 	APIAddr string
@@ -48,6 +50,12 @@ type App struct {
 	// arrives at the front and pushes every row down, so a row number does not
 	// name a session for long: the choice follows the session by ID instead.
 	SelectedID uint64
+	// selectedRow is the row Selected held when the previous frame synced the
+	// two. A row number that changed is the user choosing another row; the same
+	// number holding another session is the rows moving under the choice. The
+	// first must not be undone by chasing the old session, which is what made
+	// the second click after the inspector opened do nothing.
+	selectedRow int
 	// Detail is the tab the detail panel shows.
 	Detail int
 	// SidebarWidth and MainWidth are the two splits' first panes, which the
@@ -63,8 +71,6 @@ type App struct {
 	// ProxyAddr and CAInstalled describe the core, for the toolbar.
 	ProxyAddr   string
 	CAInstalled bool
-	// Recording reports whether the core is capturing.
-	Recording bool
 	// Version is the core's version, shown in the status bar.
 	Version string
 	// CoreMemoryMB and CoreGoroutines describe the core process. The second is
@@ -78,12 +84,11 @@ type App struct {
 	// down is why the core is unreachable, empty when it is.
 	down string
 
-	// OnToggleCapture, OnResume and OnAbort are what the toolbar and the
-	// breakpoint banner call. They are set by the command, so the view asks for
-	// an action instead of knowing how to reach the core.
-	OnToggleCapture func(on bool)
-	OnResume        func(pauseID uint64)
-	OnAbort         func(pauseID uint64)
+	// OnResume and OnAbort are what the breakpoint banner calls. They are set by
+	// the command, so the view asks for an action instead of knowing how to
+	// reach the core.
+	OnResume func(pauseID uint64)
+	OnAbort  func(pauseID uint64)
 
 	// ProxyRunning says whether the proxy is listening, and PortAddr where.
 	// PortText is what the user typed in the port field.
@@ -97,6 +102,10 @@ type App struct {
 	// one.
 	OnStartProxy func(addr string)
 	OnStopProxy  func()
+	// OnToggleProxyPanel shows the proxy's panel under its button, or closes it
+	// if it is showing. The command sets it: the panel is a window of the
+	// system's, so the view asks for it instead of drawing one in the window.
+	OnToggleProxyPanel func(anchor ui.Rect)
 
 	// backend and control are the core, as the command passed it.
 	backend Backend
@@ -175,9 +184,9 @@ func NewApp(store *Store) *App {
 		Detail:           0,
 		SidebarWidth:     200,
 		MainWidth:        760,
-		Recording:        true,
 		HostsOpen:        true,
 		SidebarSelection: "all",
+		selectedRow:      -1,
 		visibleDirty:     true,
 		hostsDirty:       true,
 	}
@@ -187,7 +196,6 @@ func NewApp(store *Store) *App {
 // the status bar.
 func (a *App) SetCoreStatus(st Status) {
 	a.ProxyAddr = st.ProxyAddr
-	a.Recording = st.Capturing
 	a.Version = st.Version
 	a.PausedCount = st.Paused
 	a.RuleCount = st.Rules
@@ -196,17 +204,10 @@ func (a *App) SetCoreStatus(st Status) {
 	a.down = ""
 }
 
-// SetCoreDown records that the core cannot be reached, which the toolbar shows
-// rather than leaving a stale "recording" light on.
+// SetCoreDown records that the core cannot be reached, which the status bar
+// shows rather than leaving a stale memory figure and a recording light on.
 func (a *App) SetCoreDown(err error) {
 	a.down = err.Error()
-	a.Recording = false
-}
-
-// SetCapturing records that capture was turned on or off.
-func (a *App) SetCapturing(on bool) {
-	a.Recording = on
-	a.down = ""
 }
 
 // SetPause records the message waiting at a breakpoint, which the banner shows.
@@ -343,7 +344,10 @@ func (a *App) reselectChosen(rows []int) bool {
 //
 // The two halves are one call because they are one invariant: Selected is a row,
 // SelectedID is the session that row means, and a frame starts by making them
-// agree again.
+// agree again. What tells the two cases apart is selectedRow: a row number the
+// user changed is a new choice and must win, while the same number holding
+// another session is the list moving under the choice — an arrival at the front
+// pushes a row down, and the choice follows the session, not the number.
 func (a *App) syncSelectionID(rows []int) {
 	if a.Selected < 0 || a.Selected >= len(rows) {
 		if a.Selected >= 0 {
@@ -351,19 +355,31 @@ func (a *App) syncSelectionID(rows []int) {
 			a.Selected = -1
 		}
 		a.SelectedID = 0
+		a.selectedRow = a.Selected
+		return
+	}
+	if a.Selected != a.selectedRow {
+		// The user chose this row. The session it holds is the choice now, and
+		// the one before is not to be chased back into view.
+		if sess, ok := a.Store.At(rows[a.Selected]); ok {
+			a.SelectedID = sess.ID
+		}
+		a.selectedRow = a.Selected
 		return
 	}
 	if a.SelectedID != 0 {
 		if sess, ok := a.Store.At(rows[a.Selected]); !ok || sess.ID != a.SelectedID {
-			// The rows moved under the choice; find the session again.
-			if !a.reselectChosen(rows) {
-				return
-			}
+			// The rows moved under the choice; find the session again, which
+			// may move Selected with it.
+			a.reselectChosen(rows)
+			a.selectedRow = a.Selected
+			return
 		}
 	}
 	if sess, ok := a.Store.At(rows[a.Selected]); ok {
 		a.SelectedID = sess.ID
 	}
+	a.selectedRow = a.Selected
 }
 
 // View builds the window's interface for a frame.
@@ -385,7 +401,21 @@ func (a *App) View(c *ui.Context) {
 	}
 
 	p := &Dark
-	ui.Column(c).Fill().Background(p.Bg).Children(func() {
+	glassy := c.Vibrancy()
+	// The window's material is behind the view and shows wherever the view
+	// paints nothing. The root is what the framework would fill with the theme's
+	// background, and that fill is opaque: left alone it hides the material under
+	// the whole window, whatever the bars below it do. So the root is cleared on
+	// such a window and painted with a smoke of the window's own colour instead —
+	// glass with a dark ground, which is what a dark interface on this system is.
+	if glassy {
+		c.Root().Background(windowFill(p.Bg, true))
+	}
+	column := ui.Column(c).Fill()
+	if !glassy {
+		column.Background(p.Bg)
+	}
+	column.Children(func() {
 		a.toolbar(c, p)
 		if a.Paused != nil {
 			a.pauseBanner(c, p)
@@ -404,19 +434,38 @@ func (a *App) View(c *ui.Context) {
 // port, which changes rarely and takes two controls, is behind a popover so that
 // it does not sit in the toolbar of a window whose proxy is running.
 func (a *App) toolbar(c *ui.Context, p *Palette) {
-	ui.Row(c).FillWidth().Height(tokenHeightToolbar).
-		Padding(tokenSpace2, tokenSpace4, tokenSpace2, tokenContentInset).
-		Background(p.Surface).AlignItems(ui.Center).Children(func() {
+	// The window's controls — the traffic lights on macOS — sit inside the
+	// content when the title bar is hidden. How much room they take is the
+	// window's answer, not a number this file could guess: it follows the title
+	// bar's style, the platform, and whether the window is full screen. The bar
+	// is laid out around that room, so the first control is never drawn under a
+	// button, and it is at least as tall as the band they sit in, so the light
+	// sits in the bar rather than over its edge.
+	bar := c.TitleBar()
+	left, right, height := barRoom(bar)
+	glassy := c.Vibrancy()
+
+	row := ui.Row(c).FillWidth().Height(height).
+		Padding(tokenSpace2, right, tokenSpace2, left).
+		Background(barFill(p.Surface, glassy)).AlignItems(ui.Center)
+	// The bar is the window's handle: every pixel of it that is not a control
+	// drags the window, as the title bar it replaced did, and a double click on
+	// it zooms the window. A control keeps its own click, because a press lands
+	// on the deepest interactive element, not on the bar behind it.
+	row.DragWindow()
+	row.Children(func() {
 		// Three groups, in the order a tool window puts them: the window's own
 		// state on the left, what narrows the pane beside it, and the switch
 		// between panes on the right. One growing spacer between the filter and
 		// the switch is what pushes the last group to the edge; two spacers put
 		// the filter in the middle, which is not where a search field belongs in
 		// a window whose left side is a list.
-		ui.Row(c).Gap(tokenSpace3).AlignItems(ui.Center).Shrink(0).Children(func() {
-			a.recordingSwitch(c, p)
-			a.proxyButton(c, p)
-		})
+		//
+		// The proxy's button is the window's own state: capture follows the
+		// proxy's listener (see proxy.Recorder), so there is no recording
+		// switch — starting the proxy is the decision to record what goes
+		// through it, and the status bar says whether it is recording.
+		a.proxyButton(c, p)
 		if a.Section == SectionTraffic {
 			ui.Row(c).Width(tokenSpace5).Height(1)
 			a.filterField(c, p)
@@ -427,6 +476,33 @@ func (a *App) toolbar(c *ui.Context, p *Palette) {
 			a.sectionControl(c, p)
 		})
 	})
+}
+
+// barRoom is the room the toolbar leaves for the window's own controls, and its
+// height.
+//
+// It is a function of the window's answer rather than of a constant so that it
+// is right on every platform and in full screen, where TitleBar is zero and
+// there are no controls to clear: macOS insets the traffic lights, Windows puts
+// its caption buttons on the right, and a window in full screen has neither.
+func barRoom(bar ui.TitleBar) (left, right, height float32) {
+	left, right, height = tokenSpace4, tokenSpace4, tokenHeightToolbar
+	if bar.Left > 0 {
+		left = bar.Left + tokenSpace3
+	}
+	if bar.Right > 0 {
+		right = bar.Right + tokenSpace3
+	}
+	if bar.Height > height {
+		height = bar.Height
+	}
+	return
+}
+
+// controlFill is the face of a control on the toolbar, from the control's own
+// state: glass at rest, a little brighter under the pointer, brighter pressed.
+func controlFill(b ui.Element, p *Palette, glassy bool) ui.Color {
+	return capsuleFill(p, glassy, b.Hovered(), b.Pressed())
 }
 
 // promptButton copies a prompt for an AI assistant to the clipboard.
@@ -447,14 +523,15 @@ func (a *App) promptButton(c *ui.Context, p *Palette) {
 		return
 	}
 	label := "给 AI"
-	colour := p.TextMuted
+	colour := p.Text
 	if a.PromptCopied {
 		label = "已复制"
 		colour = p.Success
 	}
 	btn := ui.ButtonBase(c).Label("复制给 AI 的提示词")
-	btn.Height(28).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusControl).
-		Background(p.Raised).Children(func() {
+	btn.Height(28).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusCapsule).
+		Background(controlFill(btn, p, c.Vibrancy())).
+		Border(1, capsuleBorder(p, c.Vibrancy())).Children(func() {
 		ui.Icon(c, iconSpark).Width(13).Height(13).TextColor(colour)
 		ui.Text(c, label).FontSize(tokenFontBody).TextColor(colour).SingleLine()
 	})
@@ -463,85 +540,81 @@ func (a *App) promptButton(c *ui.Context, p *Palette) {
 	}
 }
 
-// recordingSwitch says whether the core is capturing and turns it on or off.
+// proxyButton shows where the proxy listens and starts it.
 //
-// It is a switch rather than a light with words beside it: whether the proxy is
-// recording is a state that is either on or off, and macOS draws that as a
-// switch. A core that is not reachable, or a proxy that is not listening, cannot
-// record, so the switch is disabled and the words say why.
-func (a *App) recordingSwitch(c *ui.Context, p *Palette) {
-	// The switch shows the core's own answer, not a value recomputed from the
-	// proxy's state: whether the core is capturing and whether anything is
-	// listening are two facts, and folding them together made a stopped proxy
-	// look like a core that had been switched off. The switch is disabled when
-	// there is nothing to record from, which is what "cannot" means.
-	live := a.down == "" && a.ProxyRunning
-	hint := ""
-	switch {
-	case a.down != "":
-		hint = "核心未连接"
-	case !a.ProxyRunning:
-		hint = "代理未启动"
-	}
-
-	ui.Row(c).Gap(tokenSpace3).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, "录制").FontSize(tokenFontUI).TextColor(p.TextMuted)
-		on := a.Recording
-		wasOn := on
-		sw := ui.Switch(c, &on)
-		sw.Disabled(!live)
-		sw.Label("录制流量")
-		// The callback is what changes capture; the value comes back from the
-		// core on the next tick, so a toggle the core refused does not leave a
-		// switch that lies about it.
-		if on != wasOn && a.OnToggleCapture != nil {
-			a.OnToggleCapture(on)
-		}
-		if hint != "" {
-			// A note, not a label: it explains the disabled switch, so it sits a
-			// gap away in the dimmest level rather than touching the control.
-			ui.Text(c, hint).FontSize(tokenFontMicro).TextColor(p.Dim).SingleLine()
-		}
-	})
-}
-
-// proxyButton shows where the proxy listens, and opens its popover.
-//
-// The address is the one thing a user copies out of this window — into a browser,
-// a terminal, an app's proxy settings — so it stays in the toolbar in a
-// monospaced face, and only the controls for changing it hide behind the
-// popover.
+// The button is the whole start flow: a press while it is stopped starts the
+// proxy on the port the user last used, or the default one, without a panel to
+// fill in first. A press while it is running opens the panel, where the address
+// can be changed and the proxy stopped; a press after a failed start opens it
+// too, holding the reason and the field to fix. That is one press less than a
+// panel that asks for a port before anything happens, and the port is still
+// editable the moment it matters.
 func (a *App) proxyButton(c *ui.Context, p *Palette) {
-	open := a.ProxyOpen
 	value := "未启动"
-	colour := p.TextMuted
-	if a.ProxyRunning {
-		value = a.PortAddr
-		colour = p.Success
+	colour := p.Text
+	switch {
+	case a.ProxyRunning:
+		value, colour = a.PortAddr, p.Success
+	case a.PortError != "":
+		// The button says the start did not take, so that a window that tried
+		// and failed does not look like one that was never asked.
+		value, colour = "启动失败", p.Danger
 	}
 	btn := ui.ButtonBase(c).Label("代理设置")
-	btn.Height(28).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusControl).
-		Background(p.Raised).Children(func() {
+	btn.Height(28).PaddingX(tokenSpace3).Gap(tokenSpace2).Radius(tokenRadiusCapsule).
+		Background(controlFill(btn, p, c.Vibrancy())).
+		Border(1, capsuleBorder(p, c.Vibrancy())).Children(func() {
 		ui.Icon(c, iconProxy).Width(14).Height(14).TextColor(p.TextMuted)
 		ui.Text(c, value).FontSize(tokenFontBody).Font(monoFamily).
 			TextColor(colour).SingleLine()
 	})
-	// A popover does not open on its own: the button toggles the flag, and the
-	// popover draws while it is set. Clicking it again closes it, which is what a
-	// toolbar button with a popover does.
+	// The anchor is the button's own box as the last frame laid it out, which
+	// is what the system's popover needs to point at.
+	a.proxyAnchor = btn.Bounds()
 	if btn.Clicked() {
-		open = !open
+		switch {
+		case a.ProxyRunning, a.PortError != "":
+			if a.OnToggleProxyPanel != nil {
+				a.OnToggleProxyPanel(a.proxyAnchor)
+			}
+		case a.OnStartProxy != nil:
+			addr := a.PortText
+			if addr == "" {
+				addr = defaultProxyAddr
+			}
+			// Kept in the field, so the panel opens on the port that was tried
+			// rather than on an empty one.
+			a.PortText = addr
+			a.OnStartProxy(addr)
+		}
 	}
-	ui.Popover(c, btn, &open, func() {
-		a.proxyPopover(c, p)
-	})
-	a.ProxyOpen = open
 }
 
-// proxyPopover is what the proxy button opens: the port, the switch, and the
-// state of the certificate.
-func (a *App) proxyPopover(c *ui.Context, p *Palette) {
-	ui.Column(c).Width(300).Padding(tokenSpace4).Gap(tokenSpace3).Children(func() {
+// defaultProxyAddr is what one press on the proxy button starts on: the port a
+// capture tool conventionally uses, so a client can be pointed at it before the
+// window has been read.
+const defaultProxyAddr = "8899"
+
+// ProxyAnchor returns where the proxy button was drawn, which is where the
+// command hangs its panel. It is the last frame's box: an element created in
+// this frame has no box yet.
+func (a *App) ProxyAnchor() ui.Rect { return a.proxyAnchor }
+
+// ProxyPanel is the content of the proxy button's panel: the address, the
+// control that stops or starts it, and the certificate's state.
+//
+// It is shown in a window of the system's — an NSPopover on macOS — so it is a
+// view of its own: it sets the theme here, and leaves the window's material to
+// show through wherever it draws nothing.
+func (a *App) ProxyPanel(c *ui.Context) {
+	t := Dark.Theme()
+	c.SetTheme(&t)
+	p := &Dark
+	// The panel is a pane of the window's glass over the system's popover
+	// material: dark enough for the text wherever the material samples, clear
+	// enough at its edges that the native frost and arrow still read.
+	c.Root().Background(panelFill(p.Bg, c.Vibrancy()))
+	ui.Column(c).FillWidth().Padding(tokenSpace4).Gap(tokenSpace3).Children(func() {
 		ui.Text(c, "被调试的客户端把代理指向这里").FontSize(tokenFontSmall).TextColor(p.TextMuted)
 
 		if a.ProxyRunning {
@@ -550,16 +623,15 @@ func (a *App) proxyPopover(c *ui.Context, p *Palette) {
 					TextColor(p.Success).Grow(1).SingleLine()
 				if ui.Button(c, "停止").Clicked() && a.OnStopProxy != nil {
 					a.OnStopProxy()
-					a.ProxyOpen = false
 				}
 			})
 		} else {
 			input := ui.TextInput(c, &a.PortText).
 				Label("代理端口").Placeholder("端口或地址，留空则随机")
-			// The popover stays open after a click: a port that is taken is
-			// reported right here, and closing on the click would take the reason
-			// away before it was drawn. It closes once the proxy reports that it
-			// is listening, which is the answer the user was waiting for.
+			// The panel stays open across a failed start: a port that is taken
+			// is reported here, and closing on the click would take the reason
+			// away before it was drawn. It closes once the proxy reports that
+			// it is listening.
 			if input.Submitted() && a.OnStartProxy != nil {
 				a.OnStartProxy(a.PortText)
 			}
@@ -585,9 +657,47 @@ func (a *App) proxyPopover(c *ui.Context, p *Palette) {
 }
 
 // sectionControl switches the window between its panes.
+//
+// It is built from SegmentedBase rather than taken from ui.Segmented so that it
+// is a capsule, as the segments of a toolbar's switch are on macOS 26: the
+// framework's radius is the control radius, and that beside capsule buttons
+// reads as the older style. The chosen segment is a lighter pane of the same
+// glass and the others are bare on the track, which is how a toolbar's switch
+// reads on this system; a segment still lights under the pointer.
 func (a *App) sectionControl(c *ui.Context, p *Palette) {
 	sel := int(a.Section)
-	ui.Segmented(c, &sel, sections...).Height(28)
+	glassy := c.Vibrancy()
+	parts := ui.SegmentedBase(c.Key("sections"), &sel, len(sections))
+	// The track stretches its segments: a segment is as tall as the track's
+	// content box, so the chosen one is a capsule of the track's height and a
+	// hovered one lights the same shape. Left to size itself, a segment is as
+	// tall as its label, and the fill behind a hovered word is a stripe that
+	// reads as a mistake.
+	parts.Track.Height(28).Padding(2).Gap(2).Radius(tokenRadiusCapsule).
+		AlignItems(ui.Stretch).
+		Background(capsuleFill(p, glassy, false, false)).
+		Border(1, capsuleBorder(p, glassy))
+	parts.Track.Children(func() {
+		for i, label := range sections {
+			segment := parts.Segment(i).PaddingX(tokenSpace3).Radius(tokenRadiusCapsule - 2).
+				Center().Label(label)
+			face := ui.Transparent
+			switch {
+			case i == sel:
+				face = raisedFill(p, glassy)
+			case segment.Hovered():
+				face = capsuleFill(p, glassy, true, false)
+			}
+			segment.Background(face)
+			colour := p.TextMuted
+			if i == sel {
+				colour = p.Text
+			}
+			segment.Children(func() {
+				ui.Text(c, label).FontSize(tokenFontUI).TextColor(colour).SingleLine()
+			})
+		}
+	})
 	if sel != int(a.Section) && sel >= 0 && sel < len(sections) {
 		a.Section = Section(sel)
 	}
@@ -641,24 +751,42 @@ func (a *App) sidebar(c *ui.Context, p *Palette) {
 	// translucent rather than opaque: the sidebar material is behind it, and an
 	// opaque column would hide the one thing that makes a Mac window read as a
 	// Mac window. Elsewhere it composites onto the window's own background.
-	sb := ui.Sidebar(c, &sel, func() {
-		if showTraffic {
-			a.sidebarItem(c, "all", iconAll, "全部流量", a.Store.Len())
-			ui.SidebarSection(c, "域名", &a.HostsOpen, func() {
-				for _, h := range a.hosts() {
-					host := h.Host
-					a.sidebarItem(c, "host:"+host, iconHost, host, h.Count)
-				}
+	//
+	// Its accent is scoped to it. Icons and the chosen row are navigation and
+	// read in the readable blue, while the traffic table below keeps the
+	// subdued accent a log read for hours wants — the framework paints a chosen
+	// row in its theme's accent, so the two cannot share one.
+	t := p.Theme()
+	t.Accent = p.Accent
+	t.AccentHover = ui.Hex("#6ba3ff")
+	t.AccentPressed = ui.Hex("#3b78e0")
+	t.AccentText = p.AccentText
+	t.InactiveAccent = p.TextMuted
+	themed := ui.Themed(c, &t)
+	themed.Children(func() {
+		sb := ui.Sidebar(c, &sel, func() {
+			if showTraffic {
+				a.sidebarItem(c, "all", iconAll, "全部流量", a.Store.Len())
+				ui.SidebarSection(c, "域名", &a.HostsOpen, func() {
+					for _, h := range a.hosts() {
+						host := h.Host
+						a.sidebarItem(c, "host:"+host, iconHost, host, h.Count)
+					}
+				})
+				return
+			}
+			// The other panes name what they hold, so the list says what is
+			// there instead of showing an empty column beside it.
+			ui.SidebarSection(c, "本页", nil, func() {
+				a.sidebarItem(c, "section", sectionIcon(a.Section), a.Section.String(), a.sectionCount())
 			})
-			return
-		}
-		// The other panes name what they hold, so the list says what is there
-		// instead of showing an empty column beside it.
-		ui.SidebarSection(c, "本页", nil, func() {
-			a.sidebarItem(c, "section", sectionIcon(a.Section), a.Section.String(), a.sectionCount())
 		})
+		sb.Background(sidebarFill())
 	})
-	sb.Background(sidebarFill())
+	// Themed paints the theme's background behind what it holds, which over the
+	// window's material would cover it; the source list is glass like the rest
+	// of the chrome.
+	themed.Fill().Background(sidebarFill())
 
 	a.applySidebarChoice(sel, showTraffic)
 }
@@ -754,7 +882,7 @@ func (a *App) pane(c *ui.Context, p *Palette) {
 // It is honest about being a placeholder rather than an empty table: a table with
 // no rows says the core has none, which would be a different thing.
 func (a *App) placeholderPane(c *ui.Context, p *Palette, icon *ui.SVG, title, body string) {
-	ui.Column(c).Fill().Background(p.Bg).Padding(tokenSpace5).Gap(tokenSpace3).Children(func() {
+	ui.Column(c).Fill().Background(paneFill(p.Bg, c.Vibrancy())).Padding(tokenSpace5).Gap(tokenSpace3).Children(func() {
 		ui.Row(c).Gap(tokenSpace2).AlignItems(ui.Center).Children(func() {
 			ui.Icon(c, icon).Width(16).Height(16).TextColor(p.TextMuted)
 			ui.Text(c, title).Bold().FontSize(tokenFontTitle).TextColor(p.Text)
@@ -784,7 +912,7 @@ func (a *App) certificatePane(c *ui.Context, p *Palette) {
 	if a.CAInstalled {
 		state, colour = "已安装", p.Success
 	}
-	ui.Column(c).Fill().Background(p.Bg).Padding(tokenSpace5).Gap(tokenSpace3).Children(func() {
+	ui.Column(c).Fill().Background(paneFill(p.Bg, c.Vibrancy())).Padding(tokenSpace5).Gap(tokenSpace3).Children(func() {
 		ui.Row(c).Gap(tokenSpace2).AlignItems(ui.Center).Children(func() {
 			ui.Icon(c, iconCert).Width(16).Height(16).TextColor(p.TextMuted)
 			ui.Text(c, "根证书").Bold().FontSize(tokenFontTitle).TextColor(p.Text)
@@ -800,7 +928,7 @@ func (a *App) certificatePane(c *ui.Context, p *Palette) {
 
 // trafficList is the table of sessions, and the window's main subject.
 func (a *App) trafficList(c *ui.Context, p *Palette) {
-	ui.Column(c).Fill().Background(p.Bg).Children(func() {
+	ui.Column(c).Fill().Background(paneFill(p.Bg, c.Vibrancy())).Children(func() {
 		a.table(c, p)
 	})
 }
@@ -813,11 +941,20 @@ func (a *App) trafficList(c *ui.Context, p *Palette) {
 // filter did something.
 func (a *App) filterField(c *ui.Context, p *Palette) {
 	ui.Row(c).AlignItems(ui.Center).Gap(tokenSpace2).Children(func() {
-		ui.Icon(c, iconFilter).Width(13).Height(13).TextColor(p.Dim)
+		ui.Icon(c, iconFilter).Width(13).Height(13).TextColor(p.TextMuted)
 		// The label names the box for a screen reader and for a test that clicks
 		// it; the placeholder is only a hint about what it accepts.
+		//
+		// The box is a capsule of glass on the bar's material, as Safari's
+		// address field is: round-ended, with a hairline and a fill that lets
+		// the material read through. Without a material it is the plain field
+		// the theme draws, in the same shape.
+		glassy := c.Vibrancy()
 		input := ui.TextInput(c, &a.Search).
-			Label("过滤").Placeholder("过滤 URL、方法或状态码").Width(260)
+			Label("过滤").Placeholder("过滤 URL、方法或状态码").Width(260).Height(28).
+			PaddingX(tokenSpace3).Radius(tokenRadiusCapsule).
+			Background(capsuleFill(p, glassy, false, false)).
+			Border(1, capsuleBorder(p, glassy))
 		if input.Changed() {
 			// The typed text narrows the list as it is typed; the table is built
 			// after this, so it shows the new filter in this frame.

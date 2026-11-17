@@ -79,3 +79,44 @@ func TestSidebarHostFilters(t *testing.T) {
 		t.Errorf("rows = %d, want the one on cdn.test", got)
 	}
 }
+
+// TestClickingAnotherRowAfterTheInspectorOpens checks the choice moves after
+// the detail panel is already showing.
+//
+// The bug: with a row chosen, clicking a second row did nothing. The frame
+// synced the chosen session by ID, saw the row now held another session, took
+// that for the list moving under the old choice and chased the old session back
+// — so the inspector kept showing the first request. A row number the user
+// changed is a new choice and has to win.
+func TestClickingAnotherRowAfterTheInspectorOpens(t *testing.T) {
+	app, _, tt := newTester(t,
+		"https://api.test/v1/users",
+		"https://api.test/v1/orders",
+		"https://cdn.test/app.js",
+	)
+	app.Selected = -1
+	tt.Frame()
+
+	if err := tt.Click("/v1/orders"); err != nil {
+		t.Fatalf("click the first row: %v", err)
+	}
+	tt.Frame()
+	if app.Selected != 1 {
+		t.Fatalf("selected = %d, want 1 (orders)", app.Selected)
+	}
+
+	if err := tt.Click("/v1/users"); err != nil {
+		t.Fatalf("click the second row: %v", err)
+	}
+	tt.Frame()
+	if app.Selected != 2 {
+		t.Errorf("selected = %d after a second click, want 2 (users)", app.Selected)
+	}
+	sess, ok := app.SelectedSession()
+	if !ok || sess.Path() != "/v1/users" {
+		t.Errorf("the inspector shows %q, want /v1/users", sess.Path())
+	}
+	if !tt.HasText("https://api.test/v1/users") {
+		t.Error("the detail panel still draws the first request")
+	}
+}

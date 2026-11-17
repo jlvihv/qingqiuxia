@@ -81,7 +81,6 @@ func (l *Local) Status(context.Context) (Status, error) {
 	st := Status{
 		Version:   l.Version,
 		ProxyAddr: addr,
-		Capturing: l.Pipeline.Recording(),
 		Sessions:  l.Pipeline.Sessions().Len(),
 		Rules:     l.Pipeline.Rules().Len(),
 	}
@@ -114,12 +113,6 @@ func (l *Local) Sessions(_ context.Context, limit int) ([]Session, int, uint64, 
 		out = append(out, localSession(list[i]))
 	}
 	return out, store.Len(), store.Dropped(), nil
-}
-
-// SetCapture turns recording on or off.
-func (l *Local) SetCapture(_ context.Context, on bool) error {
-	l.Pipeline.SetRecording(on)
-	return nil
 }
 
 // Pauses lists what is waiting at a breakpoint.

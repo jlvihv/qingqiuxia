@@ -23,7 +23,7 @@ func (a *App) detail(c *ui.Context, p *Palette) {
 	if !ok {
 		return
 	}
-	ui.Column(c).Fill().Background(p.Surface).Children(func() {
+	ui.Column(c).Fill().Background(paneFill(p.Surface, c.Vibrancy())).Children(func() {
 		a.tabBar(c, p)
 		ui.Scroll(c).Fill().Children(func() {
 			ui.Column(c).FillWidth().Padding(tokenSpace4, 14).Gap(0).Children(func() {
@@ -322,13 +322,17 @@ func (a *App) timingPane(c *ui.Context, p *Palette, sess *Session) {
 func (a *App) statusBar(c *ui.Context, p *Palette) {
 	total, dropped := a.Store.Counts()
 	ui.Row(c).FillWidth().Height(tokenHeightStatus).PaddingX(tokenSpace4).Gap(tokenSpace4).
-		Background(p.Raised).AlignItems(ui.Center).Children(func() {
+		Background(barFill(p.Raised, c.Vibrancy())).AlignItems(ui.Center).Children(func() {
 		a.stat(c, p, "会话", fmt.Sprint(total), p.TextMuted)
 		a.stat(c, p, "丢弃", fmt.Sprint(dropped), p.Warning)
 		ui.Row(c).Grow(1)
-		a.stat(c, p, "核心", fmt.Sprintf("%d MB · %d goroutine",
-			a.CoreMemoryMB, a.CoreGoroutines), p.Dim)
-		a.stat(c, p, "api", a.Version, p.Dim)
+		core := fmt.Sprintf("%d MB · %d goroutine", a.CoreMemoryMB, a.CoreGoroutines)
+		coreColour := p.TextMuted
+		if a.down != "" {
+			core, coreColour = "未连接", p.Danger
+		}
+		a.stat(c, p, "核心", core, coreColour)
+		a.stat(c, p, "api", a.Version, p.TextMuted)
 	})
 }
 
@@ -339,7 +343,7 @@ func (a *App) statusBar(c *ui.Context, p *Palette) {
 // counts in the bar do not drift apart as traffic arrives.
 func (a *App) stat(c *ui.Context, p *Palette, label, value string, colour ui.Color) {
 	ui.Row(c).Gap(tokenSpace1).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, label).FontSize(tokenFontSmall).TextColor(p.Dim)
+		ui.Text(c, label).FontSize(tokenFontSmall).TextColor(p.TextMuted)
 		ui.Text(c, value).FontSize(tokenFontSmall).Font(monoFamily).
 			TextColor(colour).MinWidth(26).TextAlign(ui.End)
 	})

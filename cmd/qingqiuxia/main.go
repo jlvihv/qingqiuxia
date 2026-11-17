@@ -208,6 +208,10 @@ func buildCore(cfg config) (*core, error) {
 	// with nothing listening is the normal case: the user picks the port, and
 	// picks it again when it is taken, rather than the program failing to start
 	// because a number it chose for them was busy.
+	//
+	// Recording is not a switch: the proxy records what goes through it, and
+	// nothing goes through a proxy that is not listening. So there is no
+	// capture state to set here, only a listener to open.
 	if cfg.proxyAddr != "" {
 		if _, err := pr.Start(cfg.proxyAddr); err != nil {
 			db.Close()
@@ -216,14 +220,12 @@ func buildCore(cfg config) (*core, error) {
 	}
 
 	server := api.New(api.Core{
-		Pipeline:   pol,
-		Version:    version,
-		Started:    time.Now(),
-		Addr:       pr.Addr,
-		CaptureOn:  pol.Recording,
-		SetCapture: pol.SetRecording,
-		Repeat:     repeater(pr),
-		Resources:  api.ProcessResources,
+		Pipeline:  pol,
+		Version:   version,
+		Started:   time.Now(),
+		Addr:      pr.Addr,
+		Repeat:    repeater(pr),
+		Resources: api.ProcessResources,
 		// A leaf certificate per host is the cost of HTTPS capture, and the
 		// status call is where a user sees it.
 		CachedCertificates: issuer.CachedCount,
@@ -301,6 +303,13 @@ func (c *core) serve(pprofAddr string) error {
 // calls it, so a session reaches the table as the value the proxy recorded,
 // not as JSON that was encoded and decoded to cross a socket.
 func (c *core) serveWithWindow() error {
+	// The interface has one palette, and it is dark, so the app is too: a light
+	// material behind light text would be unreadable, and the system draws the
+	// menus, the window frame and a popover's material from the app's
+	// appearance. Called before Run, where it applies the app's first frame.
+	if runtime.GOOS == "darwin" {
+		mygo.Theme.SetSource(mygo.ThemeDark)
+	}
 	if c.cfg.pprofAddr != "" {
 		go func() {
 			log.Printf("pprof   http://%s/debug/pprof/", c.cfg.pprofAddr)
@@ -338,10 +347,18 @@ func (c *core) serveWithWindow() error {
 	defer cancel()
 
 	var win *mygo.Window
+	// proxyPanel is the proxy button's panel while it shows: a window of the
+	// system's, which macOS draws as an NSPopover with its own material, arrow
+	// and animation. It is a window and not a popover drawn in the main one, so
+	// it changes, redraws and dismisses on its own.
+	var proxyPanel *mygo.Window
 	invalidate := func() {
 		mygo.RunOnMain(func() {
 			if win != nil {
 				win.Invalidate()
+			}
+			if proxyPanel != nil {
+				proxyPanel.Invalidate()
 			}
 		})
 	}
@@ -368,14 +385,6 @@ func (c *core) serveWithWindow() error {
 			})
 		}()
 	}
-	app.OnToggleCapture = func(on bool) {
-		go func() {
-			if err := local.SetCapture(ctx, on); err == nil {
-				app.SetCapturing(on)
-				invalidate()
-			}
-		}()
-	}
 	app.OnResume = func(id uint64) {
 		go func() {
 			if err := local.Resume(ctx, id, false); err == nil {
@@ -393,17 +402,84 @@ func (c *core) serveWithWindow() error {
 		}()
 	}
 
-	// The proxy's switch: the window offers the port, the core opens it, and a
-	// port that is taken is an error the window shows rather than a start that
-	// fails.
+	// The proxy's panel: the system's popover, hung under the button. Its
+	// height follows the state it shows — a running proxy has an address and a
+	// stop, a stopped one a field and a start, and a failure adds its reason —
+	// so it is resized as those change instead of leaving a tall empty pane.
+	const proxyPanelWidth = 320
+	proxyPanelHeight := func() int {
+		switch {
+		case app.ProxyRunning:
+			return 140
+		case app.PortError != "":
+			// The reason can wrap to two or three lines at this width, and a
+			// native popover does not scroll: leave it the room.
+			return 230
+		}
+		return 180
+	}
+	showProxyPanel := func(anchor ui.Rect) {
+		if win == nil || proxyPanel != nil {
+			return
+		}
+		panel := mygo.NewFlyout(mygo.FlyoutOptions{
+			Parent: win,
+			// The anchor is the button's box in the window's content, which is
+			// what the system's popover points at.
+			Anchor:    mygo.Rectangle{X: int(anchor.X), Y: int(anchor.Y), Width: int(anchor.W), Height: int(anchor.H)},
+			Placement: mygo.PlacementBottomStart,
+			// Popover gives it the system's own: its material, rounded corners,
+			// shadow, arrow and animation, and the keyboard, which dismisses it
+			// as the user clicks elsewhere. Elsewhere it is a plain flyout, with
+			// the material this app uses for floating chrome.
+			Popover:      true,
+			Vibrancy:     mygo.VibrancyGlass,
+			Shadow:       true,
+			CornerRadius: 12,
+			Width:        proxyPanelWidth,
+			Height:       proxyPanelHeight(),
+			Content:      ui.View(app.ProxyPanel),
+		})
+		panel.OnClose(func(*mygo.CloseEvent) {
+			if proxyPanel == panel {
+				proxyPanel = nil
+			}
+			invalidate()
+		})
+		proxyPanel = panel
+		proxyPanel.Show()
+	}
+	toggleProxyPanel := func(anchor ui.Rect) {
+		if proxyPanel != nil {
+			proxyPanel.Close()
+			return
+		}
+		showProxyPanel(anchor)
+	}
+	app.OnToggleProxyPanel = toggleProxyPanel
+
+	// The proxy's start and stop: a press on the toolbar button starts it, a
+	// press in the panel stops it, and a port that is taken is an error the
+	// window shows rather than a start that fails silently.
 	app.OnStartProxy = func(addr string) {
 		go func() {
 			got, err := local.StartProxy(addr)
 			mygo.RunOnMain(func() {
 				if err != nil {
 					app.SetProxyError(err)
+					// A start that failed opens the panel holding the reason and
+					// the field to fix, which is the only place either can go.
+					if proxyPanel == nil {
+						showProxyPanel(app.ProxyAnchor())
+					} else {
+						proxyPanel.SetSize(proxyPanelWidth, proxyPanelHeight())
+					}
 				} else {
 					app.SetProxyRunning(got)
+					// The panel was open to watch the start; its answer arrived.
+					if proxyPanel != nil {
+						proxyPanel.Close()
+					}
 				}
 				if win != nil {
 					win.Invalidate()
@@ -419,6 +495,11 @@ func (c *core) serveWithWindow() error {
 					app.SetProxyError(err)
 				} else {
 					app.SetProxyStopped()
+				}
+				// Stopping happens in the panel itself, and the panel stays: it
+				// now holds the port field, which is where changing it starts.
+				if proxyPanel != nil {
+					proxyPanel.SetSize(proxyPanelWidth, proxyPanelHeight())
 				}
 				if win != nil {
 					win.Invalidate()
@@ -454,11 +535,22 @@ func (c *core) serveWithWindow() error {
 		}
 		if runtime.GOOS == "darwin" {
 			// macOS: no title bar of its own, so the traffic lights sit inside
-			// the toolbar and the sidebar gets the window's material, the way
-			// every tool window on the platform works.
+			// the toolbar and the window is a pane of Liquid Glass — the whole
+			// window, not just its sidebar. The chrome paints nothing over the
+			// material, the controls on it are capsules of the same glass, and
+			// the content panes darken it, so what is behind the window shows
+			// through as it does in a native app of this system (see ui.View).
+			//
 			opts.TitleBarStyle = mygo.TitleBarHiddenInset
 			opts.TrafficLightPosition = &mygo.Point{X: 20, Y: 20}
-			opts.Vibrancy = mygo.VibrancySidebar
+			opts.BackgroundColor = "#0e1014"
+			// A desktop that asks for opaque windows gets the flat window: a
+			// bar of glass under text is what that setting is for, and the view
+			// draws its own surfaces when there is no material.
+			opts.Vibrancy = mygo.VibrancyGlass
+			if mygo.Theme.Preferences().ReduceTransparency {
+				opts.Vibrancy = mygo.VibrancyNone
+			}
 		}
 		win = mygo.NewWindow(opts)
 	})
@@ -539,8 +631,13 @@ func follow(ctx context.Context, local *qqx.Local, store *qqx.Store, app *qqx.Ap
 			} else {
 				app.SetCoreStatus(st)
 			}
+			// The proxy can be started or stopped by the control API as well as
+			// by the toolbar, so the window takes its state from the core too
+			// and not only from its own clicks.
 			if running, addr := local.ProxyStatus(); running {
 				app.SetProxyRunning(addr)
+			} else if app.ProxyRunning {
+				app.SetProxyStopped()
 			}
 			invalidate()
 		})

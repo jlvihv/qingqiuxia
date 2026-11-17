@@ -144,7 +144,6 @@ func (f *failingBackend) Detail(context.Context, uint64) (Detail, error) {
 	f.calls++
 	return Detail{}, errors.New("the core is gone")
 }
-func (f *failingBackend) SetCapture(context.Context, bool) error     { return nil }
 func (f *failingBackend) Pauses(context.Context) ([]Pause, error)    { return nil, nil }
 func (f *failingBackend) Resume(context.Context, uint64, bool) error { return nil }
 func (f *failingBackend) Watch(context.Context, func(Change)) error  { return nil }
