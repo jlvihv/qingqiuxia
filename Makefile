@@ -11,8 +11,6 @@ build:
 # or a stack trace, and "go tool pprof" against a matching source tree still
 # resolves every function.
 #
-# The version is stamped in at the same time. The variable lives in main and
-# defaults to "0.1.0-dev"; a release should say what it is.
 # The version a release stamps in. Override it on the command line:
 #
 #	make release VERSION=1.2.0
@@ -21,8 +19,15 @@ build:
 # version does not end up with an empty one — which -X would happily write.
 VERSION ?= 0.1.0-dev
 
+# No -trimpath here, and it is not an oversight. It was added first and it broke
+# the release build: MyGo's native libraries (SQLite, and the window's GL and text
+# stack) are found through the module's path and the executable's own, and
+# trimming the paths out left the binary unable to find libSqlitecore.so. It
+# failed at start-up with "Sqlitecore has no build for linux-amd64" — which reads
+# like a missing platform build, while the .so was sitting in the cache the whole
+# time. A reproducible build is not worth a binary that cannot open its database.
 release:
-	go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o bin/qingqiuxia ./cmd/qingqiuxia
+	go build -ldflags="-s -w -X main.version=$(VERSION)" -o bin/qingqiuxia ./cmd/qingqiuxia
 
 run: build
 	./bin/qingqiuxia
