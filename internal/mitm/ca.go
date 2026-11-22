@@ -3,6 +3,7 @@
 package mitm
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -27,8 +28,11 @@ import (
 type CA struct {
 	// Cert is the authority's own certificate.
 	Cert *x509.Certificate
-	// Key signs leaf certificates.
-	Key *ecdsa.PrivateKey
+	// Key signs leaf certificates. It is an interface because the authority
+	// need not be one of ours: Reqable's, and every other MITM tool's, is RSA,
+	// and refusing a key because it is not the curve we would have picked
+	// would defeat the point of reusing a certificate clients already trust.
+	Key crypto.Signer
 	// PEM is the authority certificate in PEM form, for the client to install.
 	PEM []byte
 }
@@ -119,28 +123,51 @@ func Parse(certPEM, keyPEM []byte) (*CA, error) {
 	if kb == nil {
 		return nil, errors.New("mitm: no key in PEM data")
 	}
-	var key *ecdsa.PrivateKey
+	var key crypto.Signer
 	switch kb.Type {
 	case "EC PRIVATE KEY":
-		key, err = x509.ParseECPrivateKey(kb.Bytes)
-	case "PRIVATE KEY":
-		var k any
-		k, err = x509.ParsePKCS8PrivateKey(kb.Bytes)
-		if err == nil {
-			var ok bool
-			if key, ok = k.(*ecdsa.PrivateKey); !ok {
-				return nil, errors.New("mitm: the key is not an ECDSA key")
-			}
+		k, err := x509.ParseECPrivateKey(kb.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("mitm: parse key: %w", err)
 		}
+		key = k
 	case "RSA PRIVATE KEY":
-		return nil, errors.New("mitm: RSA authority keys are not supported")
+		k, err := x509.ParsePKCS1PrivateKey(kb.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("mitm: parse key: %w", err)
+		}
+		key = k
+	case "PRIVATE KEY":
+		k, err := x509.ParsePKCS8PrivateKey(kb.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("mitm: parse key: %w", err)
+		}
+		signer, ok := k.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("mitm: a %T cannot sign certificates", k)
+		}
+		key = signer
 	default:
 		return nil, fmt.Errorf("mitm: unsupported key type %q", kb.Type)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("mitm: parse key: %w", err)
+	if !samePublicKey(cert.PublicKey, key.Public()) {
+		return nil, errors.New("mitm: the key does not belong to the certificate")
 	}
-	return &CA{Cert: cert, Key: key, PEM: certPEM}, nil
+	return &CA{Cert: cert, Key: key, PEM: pem.EncodeToMemory(cb)}, nil
+}
+
+// samePublicKey reports whether two public keys are the same key, which is what
+// says that a private key may sign for a certificate.
+func samePublicKey(a, b crypto.PublicKey) bool {
+	ab, err := x509.MarshalPKIXPublicKey(a)
+	if err != nil {
+		return false
+	}
+	bb, err := x509.MarshalPKIXPublicKey(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(ab, bb)
 }
 
 // LoadOrCreate loads the authority from dir, creating and saving one when the
@@ -163,11 +190,13 @@ func LoadOrCreate(dir, commonName string) (*CA, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	keyDER, err := x509.MarshalECPrivateKey(ca.Key)
+	// PKCS#8 is what every key type is written as: it is the one encoding
+	// Parse reads for all of them, and older EC PRIVATE KEY files still load.
+	keyDER, err := x509.MarshalPKCS8PrivateKey(ca.Key)
 	if err != nil {
 		return nil, err
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
 		return nil, err
 	}
@@ -252,12 +281,13 @@ func cacheKeyFor(host string) string {
 	return host
 }
 
-// hashSubjectKeyID derives a stable subject key identifier from a public key,
-// as RFC 5280 suggests: the SHA-1 of the key's bit string.
+// hashSubjectKeyID derives a stable subject key identifier from a public key:
+// the SHA-1 of its SubjectPublicKeyInfo. Nothing verifies the value; it is
+// there because clients expect a certificate to carry one.
 func hashSubjectKeyID(key crypto.PublicKey) []byte {
-	var raw []byte
-	if k, ok := key.(*ecdsa.PublicKey); ok {
-		raw, _ = x509.MarshalPKIXPublicKey(k)
+	raw, err := x509.MarshalPKIXPublicKey(key)
+	if err != nil {
+		return nil
 	}
 	sum := sha1.Sum(raw)
 	return sum[:]

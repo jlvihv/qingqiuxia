@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
 	"net"
 	"strings"
@@ -77,22 +76,29 @@ func (i *Issuer) mint(name string) (*tls.Certificate, *cacheEntry, error) {
 	if !i.ca.Cert.NotAfter.IsZero() && notAfter.After(i.ca.Cert.NotAfter) {
 		notAfter = i.ca.Cert.NotAfter
 	}
+	// The leaf carries the issuer's name, with the host as its common name. A
+	// client that trusts Reqable's authority, or any other, then sees a chain
+	// whose subject and issuer agree, rather than an organisation naming a
+	// different tool below an issuer that names none of it.
+	subject := i.ca.Cert.Subject
+	subject.CommonName = name
+	subject.SerialNumber = ""
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject: pkix.Name{
-			CommonName:   name,
-			Organization: []string{"Qingqiuxia"},
-		},
-		NotBefore:   now.Add(-time.Hour),
-		NotAfter:    notAfter,
-		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		Subject:      subject,
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		// A leaf is never a CA, and clients reject one that says it is.
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 		// Firefox reads the subject key identifier and warns without it.
-		SubjectKeyId:   hashSubjectKeyID(&key.PublicKey),
-		AuthorityKeyId: i.ca.Cert.SubjectKeyId,
+		SubjectKeyId: hashSubjectKeyID(&key.PublicKey),
+		// An authority from elsewhere may not carry a subject key identifier;
+		// the leaf still gets one, derived the same way, so that a verifier
+		// can walk from the leaf to the issuer.
+		AuthorityKeyId: authorityKeyID(i.ca.Cert),
 	}
 	if ip := net.ParseIP(name); ip != nil {
 		tmpl.IPAddresses = []net.IP{ip}
@@ -135,4 +141,13 @@ func (i *Issuer) TLSConfig() *tls.Config {
 		},
 		MinVersion: tls.VersionTLS12,
 	}
+}
+
+// authorityKeyID is the issuer's subject key identifier, or, when the
+// certificate has none, the one it would have been given.
+func authorityKeyID(cert *x509.Certificate) []byte {
+	if len(cert.SubjectKeyId) > 0 {
+		return cert.SubjectKeyId
+	}
+	return hashSubjectKeyID(cert.PublicKey)
 }

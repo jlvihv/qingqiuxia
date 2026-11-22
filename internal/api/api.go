@@ -51,6 +51,9 @@ type Core struct {
 	// which the status call shows: a HTTPS capture that mints one per host is
 	// worth seeing the cost of.
 	CachedCertificates func() int
+	// CertificateFile is the filename offered when the authority certificate is
+	// downloaded; empty means ca.crt.
+	CertificateFile string
 	// Proxy steers the proxy's own listener. It is what the control API offers
 	// on /api/proxy, and it is separate from the traffic side: the proxy's
 	// address is what a client is pointed at, while this API is what a tool

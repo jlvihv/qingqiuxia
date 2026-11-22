@@ -366,8 +366,12 @@ func (s *Server) handleCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Query().Get("download") != "" {
+		name := s.core.CertificateFile
+		if name == "" {
+			name = "ca.crt"
+		}
 		w.Header().Set("Content-Type", "application/x-pem-file")
-		w.Header().Set("Content-Disposition", `attachment; filename="qingqiuxia-ca.crt"`)
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(ca)
 		return

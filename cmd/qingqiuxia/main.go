@@ -112,6 +112,9 @@ type config struct {
 	verbose      bool
 	pprofAddr    string
 	headless     bool
+	// caSource is where the root certificate comes from: auto, reqable,
+	// generate, or a path to Reqable's capture.bin.
+	caSource string
 	// keepSessions and keepDays bound what the database keeps.
 	keepSessions int
 	keepDays     int
@@ -122,6 +125,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.proxyAddr, "proxy", "", "address the proxy listens on; empty starts with the proxy stopped, and the window offers a port")
 	flag.StringVar(&cfg.apiAddr, "api", "127.0.0.1:8898", "address the control API listens on (it runs in window mode too)")
 	flag.StringVar(&cfg.dataDir, "data", defaultDataDir(), "directory for the certificate authority and saved rules")
+	flag.StringVar(&cfg.caSource, "ca", "reqable", "root certificate: reqable (default), auto (Reqable's when found, else generate), generate, or a path to Reqable's capture.bin")
 	flag.StringVar(&cfg.token, "token", "", "API token; empty means no token, which is only safe on loopback or a socket")
 	flag.Int64Var(&cfg.maxBody, "max-body", proxy.DefaultMaxBodyBytes, "how much of a body to keep for inspection, in bytes")
 	flag.IntVar(&cfg.sessionLimit, "sessions", 2000, "how many sessions to keep in memory")
@@ -169,11 +173,16 @@ type core struct {
 	rules    *rule.Engine
 	store    *pstore.DB
 	cfg      config
+	// caKind says where the authority came from ("reqable" or "generated"),
+	// caName is its common name, and caPath is the file to point a user at.
+	caKind string
+	caName string
+	caPath string
 }
 
 // buildCore assembles the proxy, the rules, the session store and the API.
 func buildCore(cfg config) (*core, error) {
-	ca, err := mitm.LoadOrCreate(cfg.dataDir, "Qingqiuxia Root CA")
+	ca, caKind, caPath, err := openCA(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -229,6 +238,7 @@ func buildCore(cfg config) (*core, error) {
 		// A leaf certificate per host is the cost of HTTPS capture, and the
 		// status call is where a user sees it.
 		CachedCertificates: issuer.CachedCount,
+		CertificateFile:    certificateFile(caKind),
 		RulesChanged: func(specs []rule.Spec) {
 			// 规则一改就落盘：写规则的人不想因为窗口崩了就重写一遍。
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -257,7 +267,72 @@ func buildCore(cfg config) (*core, error) {
 	return &core{
 		proxy: pr, server: server, pipeline: pol,
 		rules: rules, store: db, cfg: cfg,
+		caKind: caKind, caName: ca.Cert.Subject.CommonName, caPath: caPath,
 	}, nil
+}
+
+// openCA chooses the authority that signs intercepted certificates.
+//
+// Reqable's is the default: a client that already trusts it, or a phone with its
+// certificate installed, needs nothing more, and asking for a second certificate
+// install to use a second tool is exactly the friction this avoids. When Reqable
+// is not on the machine the core says so rather than silently minting a
+// different authority; -ca auto is the caller who wants the fallback.
+func openCA(cfg config) (*mitm.CA, string, string, error) {
+	switch src := cfg.caSource; src {
+	case "", "reqable":
+		ca, path, err := mitm.LoadReqable("")
+		if errors.Is(err, mitm.ErrReqableNotFound) {
+			return nil, "", "", fmt.Errorf("%w; run Reqable once so it writes its certificate, or pass -ca generate to use one of this tool's own", err)
+		}
+		if err != nil {
+			return nil, "", "", err
+		}
+		return ca, "reqable", path, nil
+	case "auto":
+		ca, path, err := mitm.LoadReqable("")
+		if err == nil {
+			return ca, "reqable", path, nil
+		}
+		if !errors.Is(err, mitm.ErrReqableNotFound) {
+			// A certificate that is there but unreadable is a problem to
+			// report, not to paper over with a different authority: clients
+			// were told to trust the one in the file.
+			return nil, "", "", err
+		}
+		return generateCA(cfg, "no Reqable certificate found; generating one")
+	case "generate":
+		return generateCA(cfg, "")
+	default:
+		ca, err := mitm.LoadReqableFile(src)
+		if err != nil {
+			return nil, "", "", err
+		}
+		return ca, "reqable", src, nil
+	}
+}
+
+// certificateFile is the name offered when the certificate is downloaded. A
+// Reqable authority is named as Reqable names it, so that a user who already has
+// reqable-ca.crt on a device recognises the file.
+func certificateFile(kind string) string {
+	if kind == "reqable" {
+		return "reqable-ca.crt"
+	}
+	return "qingqiuxia-ca.crt"
+}
+
+// generateCA loads the authority saved in the data directory, or creates one,
+// which is what this core did before Reqable's certificate could be shared.
+func generateCA(cfg config, why string) (*mitm.CA, string, string, error) {
+	if why != "" {
+		log.Printf("ca      %s", why)
+	}
+	ca, err := mitm.LoadOrCreate(cfg.dataDir, "Qingqiuxia Root CA")
+	if err != nil {
+		return nil, "", "", err
+	}
+	return ca, "generated", filepath.Join(cfg.dataDir, "ca.crt"), nil
 }
 
 // log says where the proxy is and what to install.
@@ -273,8 +348,12 @@ func (c *core) log() {
 	// The index is written for an assistant reading with curl, and it is the
 	// first thing anyone pointing a tool at this core should read.
 	log.Printf("for AI  http://%s/api  (plain text: what it can do, what each call costs)", c.server.Addr())
-	log.Printf("ca      %s", filepath.Join(c.cfg.dataDir, "ca.crt"))
-	log.Printf("install the CA certificate in your client to see HTTPS traffic")
+	if c.caKind == "reqable" {
+		log.Printf("ca      %s  (%s; clients that trust Reqable need nothing more)", c.caPath, c.caName)
+	} else {
+		log.Printf("ca      %s  (%s)", c.caPath, c.caName)
+		log.Printf("install the CA certificate in your client to see HTTPS traffic")
+	}
 }
 
 // serve runs the core alone until a signal stops it.

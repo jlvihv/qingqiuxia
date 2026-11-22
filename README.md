@@ -27,15 +27,41 @@ go build -o qingqiuxia ./cmd/qingqiuxia
 并带上版本号（`make release VERSION=1.2.0`）。调试时用 `make build`，崩溃时
 的堆栈才有文件名和行号。
 
-首次启动会在 `~/.config/qingqiuxia/` 生成 CA。让客户端信任它，就能看到 HTTPS 明文：
+抓 HTTPS 要一张客户端信得过的根证书。默认直接复用 **Reqable** 的证书：签名用它，
+叶子证书的名字也随它（`O=Reqable, LLC`、`OU=https://reqable.com/`），下载下来的文件
+叫 `reqable-ca.crt`。已经信任 Reqable 的设备、手机、模拟器不用再装第二张：
 
 ```sh
-# curl
-curl --proxy http://127.0.0.1:8899 --cacert ~/.config/qingqiuxia/ca.crt https://example.com/
+# 拿到当前在用的证书（默认就是 Reqable 的）
+curl -OJ 'http://127.0.0.1:8898/api/certificate?download=1'
 
-# 或者下载后装进系统信任库
-curl -O http://127.0.0.1:8898/api/certificate?download=1
+# curl 用它
+curl --proxy http://127.0.0.1:8899 --cacert reqable-ca.crt https://example.com/
 ```
+
+想把证书装进系统信任库，也是下载后导入。
+
+### 根证书从哪来
+
+| 平台 | Reqable 的证书文件 |
+|---|---|
+| macOS | `~/Library/Application Support/com.reqable.macosx/certificate/capture.bin` |
+| Windows | `%APPDATA%\Reqable\certificate\capture.bin` |
+| Linux | `~/.local/share/reqable/certificate/capture.bin` |
+
+`capture.bin` 是 Reqable 存 CA 的 JSON：证书和 PKCS#8 私钥都在里面，明文。
+Reqable 升级不换它，否则用户之前装的证书就全废了，所以直接读是稳的。
+
+`-ca` 决定用哪张：
+
+| 值 | 行为 |
+|---|---|
+| `reqable`（默认） | 必须用 Reqable 的，找不到就报错退出，不会偷偷换一张 |
+| `auto` | 找到 Reqable 就用；找不到在 `~/.config/qingqiuxia/` 生成一张 |
+| `generate` | 不管 Reqable，用 `~/.config/qingqiuxia/ca.crt`（没有就生成） |
+| 一个路径 | 直接读这个 `capture.bin`，Reqable 装在别处时用 |
+
+在 Reqable 里重新生成了根证书之后，重启核心才会跟上。
 
 然后看抓到了什么：
 
@@ -51,6 +77,7 @@ curl -s 127.0.0.1:8898/api/sessions | jq '.sessions[0]'
 -headless 只跑核心，不开窗口，同时启用 HTTP API
 -api      -headless 时的 API 地址（默认 127.0.0.1:8898）
 -data     CA 和规则文件所在目录（默认 ~/.config/qingqiuxia）
+-ca       根证书来源：reqable（默认）/ auto / generate / capture.bin 路径
 -token    API 令牌，默认空（只在回环地址或 socket 上安全）
 -max-body 每个 body 保留多少字节用于查看和改写（默认 4 MiB）
 -sessions 内存里保留多少条会话（默认 2000）
