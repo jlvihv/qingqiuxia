@@ -63,6 +63,34 @@ Reqable 升级不换它，否则用户之前装的证书就全废了，所以直
 
 在 Reqable 里重新生成了根证书之后，重启核心才会跟上。
 
+### 多台机器共用一张证书
+
+同一张 CA 可以让所有设备只装一次证书。换机器时别让它自己生成新的，把旧机器的
+证书带过去：
+
+1. **Reqable 之间**（推荐）：旧机器「证书 → 根证书管理 → 导出根证书 (.p12)」，
+   新机器完全退出 Reqable 后「根证书管理 → 导入根证书 (.p12)」。导入后新机器的
+   `capture.bin` 就是同一张，默认会被读到。
+2. **只给这个工具用**：把 `capture.bin` 拷过去，用路径指定，不动新机器的 Reqable：
+
+   ```sh
+   chmod 600 ~/reqable-capture.bin
+   qingqiuxia -ca ~/reqable-capture.bin
+   ```
+
+手头只有 cert 和 key 时，写一个只含 `cert`、`pkey` 的 JSON 就够这个工具用；
+Reqable 自己可能会校验 `fingerprint` 等字段，要它认还是走 p12 导入。
+
+确认两边是同一张：
+
+```sh
+python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["cert"])' capture.bin \
+  | openssl x509 -noout -subject -fingerprint -sha256
+```
+
+`capture.bin` 是明文私钥：权限 0600，不要提交、不要放同步盘。怀疑泄露就重新
+生成，并给所有信任过它的设备重装证书 —— 这张 CA 没有吊销机制。
+
 然后看抓到了什么：
 
 ```sh
